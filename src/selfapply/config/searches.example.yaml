@@ -1,0 +1,63 @@
+# SelfApply search configuration
+# Copy to ~/.selfapply/searches.yaml and customize for your job search.
+# The wizard (selfapply init) generates a basic version automatically.
+
+# Search queries -- each has a query string and priority tier.
+# Tier 1: High-priority exact matches (searched first, highest precision)
+# Tier 2: Strong matches, broader scope
+# Tier 3: Wide net, high volume, lower precision
+queries:
+  - query: "YOUR_PRIMARY_JOB_TITLE"
+    tier: 1
+  - query: "YOUR_ALTERNATE_JOB_TITLE"
+    tier: 2
+  - query: "YOUR_BROADER_OCCUPATION"
+    tier: 3
+
+# Locations to search
+locations:
+  - location: "Your city or region"
+    remote: false
+  - location: "Remote"
+    remote: true
+
+# Location filtering -- accept/reject patterns for job location text
+location:
+  accept_patterns:
+    - "Your city"
+    - "Your metro area"
+    - "Remote"
+    - "Anywhere"
+    - "Your country"
+  reject_patterns:
+    - "onsite only"
+    - "outside your accepted locations"
+
+# Country for Indeed/LinkedIn/Google Jobs searches
+country: "YOUR_COUNTRY"
+
+# JobSpy source boards (all available options shown)
+boards:
+  - indeed
+  - linkedin
+  - glassdoor
+  - zip_recruiter
+  - google
+
+# Search defaults
+defaults:
+  results_per_site: 100  # Max results per board per query
+  hours_old: 72          # Only jobs posted within this many hours
+
+# Negative keywords -- skip jobs with these in the title (case-insensitive)
+exclude_titles:
+  - "senior director"
+  - "VP "
+  - "vice president"
+  - "chief"
+  - "intern"
+  - "internship"
+  - "co-op"
+  - "clearance required"
+  - "TS/SCI"
+  - "principal scientist"
