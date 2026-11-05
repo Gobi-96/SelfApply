@@ -1,12 +1,16 @@
 name: Publish to PyPI
 
 on:
-  push:
-    tags:
-      - "v*"
+  release:
+    types: [published]
+  workflow_dispatch:
 
 jobs:
   publish:
+    # Publishing is intentionally opt-in. Before enabling it, configure this
+    # repository as a PyPI Trusted Publisher and create the repository variable
+    # PYPI_PUBLISH_ENABLED=true.
+    if: ${{ vars.PYPI_PUBLISH_ENABLED == 'true' }}
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
@@ -14,10 +18,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
