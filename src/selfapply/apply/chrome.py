@@ -136,19 +136,20 @@ def _kill_process_tree(pid: int) -> None:
         else:
             # Unix: kill entire process group
             import os
+            kill_signal = getattr(_signal, "SIGKILL", _signal.SIGTERM)
             try:
                 target_group = os.getpgid(pid)
                 # A child is normally launched in its own session. If that
                 # setup ever fails, never kill the caller's process group:
                 # doing so would terminate the persistent SelfApply worker.
                 if target_group == os.getpgrp():
-                    os.kill(pid, _signal.SIGKILL)
+                    os.kill(pid, kill_signal)
                 else:
-                    os.killpg(target_group, _signal.SIGKILL)
+                    os.killpg(target_group, kill_signal)
             except (ProcessLookupError, PermissionError):
                 # Process already gone or owned by another user
                 try:
-                    os.kill(pid, _signal.SIGKILL)
+                    os.kill(pid, kill_signal)
                 except (ProcessLookupError, PermissionError):
                     pass
     except Exception:
