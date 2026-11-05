@@ -234,10 +234,15 @@ def validate_json_fields(data: dict, profile: dict, mode: str = "normal",
     errors: list[str] = []
     warnings: list[str] = []
 
-    # Required keys — always checked regardless of mode
-    for key in ("title", "summary", "skills", "experience", "projects", "education"):
+    # Projects are optional because many valid resumes (especially uploaded by
+    # first-time users) contain only work experience and education. Requiring
+    # a non-empty project list made every tailored resume fall back to the
+    # master for those users.
+    for key in ("title", "summary", "skills", "experience", "education"):
         if key not in data or not data[key]:
             errors.append(f"Missing required field: {key}")
+    if "projects" not in data:
+        errors.append("Missing required field: projects")
     if errors:
         return {"passed": False, "errors": errors, "warnings": warnings}
 
@@ -381,7 +386,13 @@ def validate_tailored_resume(text: str, profile: dict, original_text: str = "",
         "PROJECTS": ["projects", "personal projects", "key projects", "selected projects"],
         "EDUCATION": ["education", "academic background"],
     }
+    projects_expected = bool(resume_facts.get("preserved_projects")) or any(
+        re.search(rf"(?im)^\s*{re.escape(variant)}\s*:?[ \t]*$", original_text)
+        for variant in section_variants["PROJECTS"]
+    )
     for section, variants in section_variants.items():
+        if section == "PROJECTS" and not projects_expected:
+            continue
         if not any(
             re.search(rf"(?im)^\s*{re.escape(v)}\s*:?[ \t]*$", text)
             for v in variants

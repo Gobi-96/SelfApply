@@ -1,4 +1,5 @@
 import unittest
+import sqlite3
 from tempfile import TemporaryDirectory
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -6,9 +7,13 @@ from unittest.mock import Mock, patch
 from selfapply import database
 from selfapply.apply.chrome import (
     _kill_process_tree,
+    cleanup_worker,
     cleanup_on_exit,
+    has_google_auth_session,
     launch_chrome,
+    mark_shared_session_updated,
     prune_worker_profile_cache,
+    setup_worker_profile,
 )
 from selfapply.apply.launcher import (
     _active_exclusions,
@@ -802,6 +807,73 @@ class CodexAdapterTests(unittest.TestCase):
             self.assertTrue((profile / "Default" / "Cookies").exists())
             self.assertTrue((profile / "Default" / "Local Storage").exists())
             self.assertTrue((profile / "Default" / "Extensions").exists())
+
+    def test_master_resume_mode_resolves_the_uploaded_master_pdf(self):
+        with TemporaryDirectory() as root:
+            master = Path(root) / "resume.pdf"
+            master.write_bytes(b"master")
+            with (
+                patch(
+                    "selfapply.apply.launcher.config.application_resume_mode",
+                    return_value="master",
+                ),
+                patch("selfapply.apply.launcher.config.RESUME_PDF_PATH", master),
+            ):
+                from selfapply.apply.launcher import _resolved_resume_pdf
+                self.assertEqual(
+                    _resolved_resume_pdf({
+                        "tailored_resume_path": "/missing/tailored.txt",
+                    }),
+                    master,
+                )
+
+    def test_google_session_requires_auth_cookie_not_remembered_account(self):
+        with TemporaryDirectory() as root:
+            profile = Path(root)
+            cookie_db = profile / "Default" / "Cookies"
+            cookie_db.parent.mkdir(parents=True)
+            connection = sqlite3.connect(cookie_db)
+            connection.execute("CREATE TABLE cookies (host_key TEXT, name TEXT)")
+            connection.execute(
+                "INSERT INTO cookies VALUES (?, ?)",
+                ("accounts.google.com", "ACCOUNT_CHOOSER"),
+            )
+            connection.commit()
+            connection.close()
+            self.assertFalse(has_google_auth_session(profile))
+            connection = sqlite3.connect(cookie_db)
+            connection.execute(
+                "INSERT INTO cookies VALUES (?, ?)", (".google.com", "SID"),
+            )
+            connection.commit()
+            connection.close()
+            self.assertTrue(has_google_auth_session(profile))
+
+    def test_existing_secondary_worker_refreshes_shared_sign_in_state(self):
+        with TemporaryDirectory() as root:
+            workers = Path(root)
+            primary = workers / "worker-0"
+            secondary = workers / "worker-1"
+            (primary / "Default").mkdir(parents=True)
+            (secondary / "Default").mkdir(parents=True)
+            (primary / "Default" / "Cookies").write_text("new-google-session")
+            (secondary / "Default" / "Cookies").write_text("stale-session")
+            with patch("selfapply.apply.chrome.config.CHROME_WORKER_DIR", workers):
+                mark_shared_session_updated()
+                self.assertEqual(setup_worker_profile(1), secondary)
+            self.assertEqual(
+                (secondary / "Default" / "Cookies").read_text(),
+                "new-google-session",
+            )
+
+    def test_worker_cleanup_lets_chrome_flush_before_forced_cleanup(self):
+        process = Mock(pid=4321)
+        process.poll.return_value = None
+        with patch("selfapply.apply.chrome._kill_process_tree") as hard_kill:
+            cleanup_worker(0, process)
+        process.terminate.assert_called_once()
+        process.wait.assert_called_once_with(timeout=8)
+        hard_kill.assert_not_called()
 
     def test_applied_result_archives_the_exact_job_resume(self):
         with TemporaryDirectory() as root:

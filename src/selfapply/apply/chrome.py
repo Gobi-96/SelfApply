@@ -8,6 +8,7 @@ import json
 import logging
 import platform
 import shutil
+import sqlite3
 import subprocess
 import threading
 import time
@@ -32,6 +33,77 @@ _DISPOSABLE_CACHE_NAMES = {
     "CacheStorage", "component_crx_cache", "optimization_guide_model_store",
     "BrowserMetrics", "BrowserMetrics-spare.pma", "Crashpad",
 }
+
+_SESSION_MARKER = ".shared-session"
+_GOOGLE_AUTH_COOKIES = {
+    "SID", "HSID", "SSID", "APISID", "SAPISID",
+    "__Secure-1PSID", "__Secure-3PSID",
+}
+
+
+def _copy_profile_contents(source: Path, destination: Path) -> None:
+    """Copy reusable browser state while excluding caches and sibling profiles."""
+    destination.mkdir(parents=True, exist_ok=True)
+    skip = {
+        "ShaderCache", "GrShaderCache", "Service Worker", "Cache",
+        "Code Cache", "GPUCache", "CacheStorage", "Crashpad",
+        "BrowserMetrics", "SafeBrowsing", "Crowd Deny",
+        "MEIPreload", "SSLErrorAssistant", "recovery", "Temp",
+        "SingletonLock", "SingletonSocket", "SingletonCookie",
+    }
+    for item in source.iterdir():
+        if item.name.startswith("Profile ") or item.name in {
+            "Guest Profile", "System Profile",
+        }:
+            continue
+        if item.name in skip:
+            continue
+        destination_item = destination / item.name
+        try:
+            if item.is_dir():
+                shutil.copytree(
+                    str(item), str(destination_item), dirs_exist_ok=True,
+                    ignore=shutil.ignore_patterns(
+                        "Cache", "Code Cache", "GPUCache", "Service Worker",
+                    ),
+                )
+            else:
+                shutil.copy2(str(item), str(destination_item))
+        except (PermissionError, OSError):
+            logger.debug("Could not copy browser state %s", item, exc_info=True)
+
+
+def mark_shared_session_updated() -> None:
+    """Mark worker 0 as the canonical authenticated profile for later workers."""
+    marker = config.CHROME_WORKER_DIR / "worker-0" / _SESSION_MARKER
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(str(time.time()), encoding="utf-8")
+
+
+def has_google_auth_session(profile_dir: Path | None = None) -> bool:
+    """Return whether managed Chrome contains a real Google login cookie.
+
+    An ACCOUNT_CHOOSER cookie only remembers an email address and is not an
+    authenticated Google session, so it deliberately does not qualify.
+    """
+    root = profile_dir or (config.CHROME_WORKER_DIR / "worker-0")
+    candidates = (root / "Default" / "Cookies", root / "Default" / "Network" / "Cookies")
+    for cookie_db in candidates:
+        if not cookie_db.exists():
+            continue
+        try:
+            with sqlite3.connect(f"file:{cookie_db}?mode=ro", uri=True, timeout=0.2) as connection:
+                placeholders = ",".join("?" for _ in _GOOGLE_AUTH_COOKIES)
+                row = connection.execute(
+                    f"SELECT 1 FROM cookies WHERE host_key LIKE '%google.com' "
+                    f"AND name IN ({placeholders}) LIMIT 1",
+                    tuple(sorted(_GOOGLE_AUTH_COOKIES)),
+                ).fetchone()
+            if row:
+                return True
+        except (OSError, sqlite3.Error):
+            logger.debug("Could not inspect Google cookies in %s", cookie_db, exc_info=True)
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -128,6 +200,16 @@ def setup_worker_profile(worker_id: int) -> Path:
     """
     profile_dir = config.CHROME_WORKER_DIR / f"worker-{worker_id}"
     if (profile_dir / "Default").exists():
+        if worker_id:
+            primary = config.CHROME_WORKER_DIR / "worker-0"
+            source_marker = primary / _SESSION_MARKER
+            target_marker = profile_dir / _SESSION_MARKER
+            if source_marker.exists() and (
+                not target_marker.exists()
+                or source_marker.stat().st_mtime_ns > target_marker.stat().st_mtime_ns
+            ):
+                logger.info("[worker-%d] Refreshing shared sign-in session", worker_id)
+                _copy_profile_contents(primary, profile_dir)
         return profile_dir  # Already initialized
 
     # Find a source: prefer existing worker (has session cookies), else user profile
@@ -146,38 +228,7 @@ def setup_worker_profile(worker_id: int) -> Path:
                 worker_id, source.name)
     profile_dir.mkdir(parents=True, exist_ok=True)
 
-    # Copy essential profile dirs -- skip caches and heavy transient data
-    skip = {
-        "ShaderCache", "GrShaderCache", "Service Worker", "Cache",
-        "Code Cache", "GPUCache", "CacheStorage", "Crashpad",
-        "BrowserMetrics", "SafeBrowsing", "Crowd Deny",
-        "MEIPreload", "SSLErrorAssistant", "recovery", "Temp",
-        "SingletonLock", "SingletonSocket", "SingletonCookie",
-    }
-
-    for item in source.iterdir():
-        # A worker explicitly launches the Default profile. Copying Profile 1,
-        # Profile 2, Guest Profile, and similar siblings wastes gigabytes and
-        # never contributes cookies to the launched browser.
-        if item.name.startswith("Profile ") or item.name in {
-            "Guest Profile", "System Profile",
-        }:
-            continue
-        if item.name in skip:
-            continue
-        dst = profile_dir / item.name
-        try:
-            if item.is_dir():
-                shutil.copytree(
-                    str(item), str(dst), dirs_exist_ok=True,
-                    ignore=shutil.ignore_patterns(
-                        "Cache", "Code Cache", "GPUCache", "Service Worker",
-                    ),
-                )
-            else:
-                shutil.copy2(str(item), str(dst))
-        except (PermissionError, OSError):
-            pass  # skip locked files
+    _copy_profile_contents(source, profile_dir)
 
     return profile_dir
 
@@ -348,7 +399,13 @@ def cleanup_worker(worker_id: int, process: subprocess.Popen | None) -> None:
         process: The Popen handle returned by launch_chrome.
     """
     if process and process.poll() is None:
-        _kill_process_tree(process.pid)
+        # Let Chrome flush cookies and local storage before falling back to the
+        # hard process-tree cleanup used for genuinely stuck browsers.
+        try:
+            process.terminate()
+            process.wait(timeout=8)
+        except (subprocess.TimeoutExpired, OSError):
+            _kill_process_tree(process.pid)
     with _chrome_lock:
         _chrome_procs.pop(worker_id, None)
     logger.info("[worker-%d] Chrome cleaned up", worker_id)

@@ -1,11 +1,39 @@
-<!-- logo here -->
-
 > **SelfApply** is an open-source application. See
 > [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for license disclosures.
 
 # SelfApply
 
-**A local, UI-first job discovery, résumé tailoring, and application assistant.**
+**A local, UI-first job discovery, resume tailoring, and application assistant.**
+
+SelfApply keeps candidate profiles, resumes, job history, browser sessions, and
+API credentials on the user's computer. It does not install a login item or
+start an application worker automatically; work begins only when the user
+starts it from the Control Center or CLI.
+
+![SelfApply onboarding and readiness checklist](docs/images/selfapply-onboarding.jpg)
+
+## Highlights
+
+- Guided local setup with readiness checks before applications can run
+- Up to five isolated candidate profiles on one computer
+- Job discovery across major boards, Workday portals, and direct career sites
+- AI fit scoring, factual resume tailoring, and cover-letter generation
+- DOCX/PDF resume preservation with change reports and validation
+- Guarded browser automation through Codex, including a no-submit dry-run mode
+- Application history, retry controls, worker limits, and spending caps
+- Local backup and reset tools for profiles, documents, logs, and sessions
+
+## Before you use it
+
+1. Create your profile in the Control Center; do not add personal data or API
+   keys to files inside this repository.
+2. Start with `selfapply apply --dry-run` and inspect the filled form before
+   enabling submission.
+3. Review every tailored resume and answer. The user remains responsible for
+   the accuracy of submitted information.
+4. Use a dedicated job-site password rather than a password reused elsewhere.
+5. Respect job-board terms, rate limits, and local law. SelfApply does not
+   bypass CAPTCHAs, forced logins, expired listings, or blocked sites.
 
 ## Quick start (UI-first, recommended)
 
@@ -15,26 +43,41 @@ tailoring, cover-letter, PDF, database, Chrome, and application prompt flow.
 
 The Control Center is the UI-first setup path. On first launch, its onboarding
 checklist guides a new user through **Profile**, **Job preferences**,
-**Résumé**, and **AI & browser** before the application workspace unlocks.
+**Resume**, and **AI & browser** before the application workspace unlocks.
 Recognizable OpenAI, Anthropic, and Gemini API-key prefixes select the provider;
 the real connection test verifies the saved provider and model. The UI starts
 and stops the guarded worker. No other terminal setup command is required.
 
+### Sample profile
+
+The repository's [`profile.example.json`](profile.example.json) contains only
+fictional placeholders. The screenshot below was captured from an isolated
+temporary SelfApply home using fictional data; it contains no developer or
+candidate account information.
+
+![SelfApply profile loaded with fictional sample data](docs/images/selfapply-profile.jpg)
+
 ```bash
-cd ~/SelfApply
+git clone https://github.com/Gobi-96/SelfApply.git
+cd SelfApply
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -e .
-pip install --no-deps python-jobspy
-pip install pydantic tls-client requests markdownify regex
+python -m pip install --upgrade pip
+python -m pip install -e .
+python -m pip install --no-deps python-jobspy
+python -m pip install pydantic tls-client requests markdownify regex
 playwright install chromium
 
 selfapply ui
 ```
 
+Prefer a source archive instead of Git? Download the
+[latest `main` ZIP](https://github.com/Gobi-96/SelfApply/archive/refs/heads/main.zip),
+extract it, and run the same setup commands from the extracted folder.
+
 All candidate data stays in `~/.selfapply`. **Settings → Back up and reset local
 data** stops the worker, moves the current profile, application history,
-résumés, logs, sessions, and secrets into a private timestamped local backup,
+resumes, logs, sessions, and secrets into a private timestamped local backup,
 then returns the app to first-run onboarding.
 
 Windows PowerShell activation is `.\.venv\Scripts\Activate.ps1`; Windows
@@ -107,7 +150,7 @@ Runs stages 1-5: discovers jobs, scores them, tailors your resume, generates cov
 | **1. Discover** | Scrapes 5 job boards (Indeed, LinkedIn, Glassdoor, ZipRecruiter, Google Jobs) + 48 Workday employer portals + 30 direct career sites |
 | **2. Enrich** | Fetches full job descriptions via JSON-LD, CSS selectors, or AI-powered extraction |
 | **3. Score** | AI rates every job 1-10 based on your resume and preferences. Only high-fit jobs proceed |
-| **4. Tailor** | AI rewrites your resume per job: reorganizes, emphasizes relevant experience, adds keywords. Never fabricates |
+| **4. Tailor** | AI applies targeted JD-aware edits inside a clone of your master resume while preserving its structure, links, employers, titles, and dates |
 | **5. Cover Letter** | AI generates a targeted cover letter per job |
 | **6. Auto-Apply** | Codex (or optional Claude fallback) navigates application forms, fills fields, uploads documents, answers questions, and submits |
 
@@ -145,7 +188,7 @@ Each stage is independent. Run them all or pick what you need.
 
 | Component | What It Does |
 |-----------|-------------|
-| CapSolver API key | Solves CAPTCHAs during auto-apply (hCaptcha, reCAPTCHA, Turnstile, FunCaptcha). Without it, CAPTCHA-blocked applications just fail gracefully |
+| CapSolver API key | Optional third-party CAPTCHA integration. Without it, CAPTCHA-blocked applications stop for manual handling |
 
 > **Note:** python-jobspy is installed separately with `--no-deps` because it pins an exact numpy version in its metadata that conflicts with pip's resolver. It works fine with modern numpy at runtime.
 
@@ -157,6 +200,10 @@ All generated by `selfapply init`:
 
 ### `profile.json`
 Your personal data in one structured file: contact info, work authorization, compensation, experience, skills, resume facts (preserved during tailoring), and EEO defaults. Powers scoring, tailoring, and form auto-fill.
+
+Runtime profiles are stored below `~/.selfapply/profiles/` and are ignored by
+Git. Enter passwords and API keys through the local UI; never put real secrets
+in `profile.example.json`, `.env.example`, screenshots, issues, or commits.
 
 ### `searches.yaml`
 Job search queries, target titles, locations, boards. Run multiple searches with different parameters.
@@ -183,13 +230,13 @@ Visits each job URL and extracts the full description. 3-tier cascade: JSON-LD s
 AI scores every job 1-10 against your profile. 9-10 = strong match, 7-8 = good, 5-6 = moderate, 1-4 = skip. Only jobs above your threshold proceed to tailoring.
 
 ### Tailor
-Generates a custom resume per job: reorders experience, emphasizes relevant skills, incorporates keywords from the job description. Your `resume_facts` (companies, projects, metrics) are preserved exactly. The AI reorganizes but never fabricates.
+Generates a custom resume per job using anchored edits rather than rebuilding the whole document. DOCX uploads retain their styles, spacing, tables, columns, links, headers, footers, employer names, titles, and dates; PDF uploads use best-effort in-place editing with a visible fidelity warning when reconstruction is required. Each job stores its TXT extraction, patch manifest, report, source-format document, and verified application PDF. If creative skill expansion is enabled, unsupported additions are warnings rather than blockers and should be reviewed before use.
 
 ### Cover Letter
 Writes a targeted cover letter per job referencing the specific company, role, and how your experience maps to their requirements.
 
 ### Auto-Apply
-The selected browser agent launches or connects to Chrome, navigates to each application page, detects the form type, fills personal information and work history, uploads the tailored résumé and cover letter, answers screening questions with AI, and submits. A live dashboard shows progress in real time.
+The selected browser agent launches or connects to Chrome, navigates to each application page, detects the form type, fills personal information and work history, uploads the tailored resume and cover letter, answers screening questions with AI, and submits. A live dashboard shows progress in real time.
 
 The Playwright MCP server is configured automatically at runtime per worker. No manual MCP setup needed.
 
@@ -241,6 +288,9 @@ Contributions are welcome. Start with the
 
 The source repository is available at
 [github.com/Gobi-96/SelfApply](https://github.com/Gobi-96/SelfApply).
+
+If SelfApply is useful to you, you can support continued development through
+[GitHub Sponsors](https://github.com/sponsors/Gobi-96).
 
 ---
 

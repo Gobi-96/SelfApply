@@ -15,6 +15,7 @@ import random
 import re
 import signal
 import shutil
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -175,6 +176,8 @@ def _clean_optional_url(value: object) -> str | None:
 
 def _resolved_resume_pdf(job: dict) -> Path | None:
     """Return the existing PDF a worker can actually upload for this job."""
+    if config.application_resume_mode() == "master":
+        return config.RESUME_PDF_PATH if config.RESUME_PDF_PATH.is_file() else None
     raw = str(job.get("tailored_resume_path") or "").strip()
     if not raw:
         return None
@@ -1704,8 +1707,18 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
         conn.commit()
 
         job = dict(row)
+        if config.application_resume_mode() == "master":
+            job["tailored_resume_path"] = str(config.RESUME_PATH)
         job["application_url"] = _clean_optional_url(job.get("application_url"))
         return job
+    except sqlite3.OperationalError as exc:
+        conn.rollback()
+        if "locked" in str(exc).casefold() or "busy" in str(exc).casefold():
+            logger.warning(
+                "Worker %d is waiting for the job database; it will retry.", worker_id,
+            )
+            return None
+        raise
     except Exception:
         conn.rollback()
         raise
@@ -1724,7 +1737,11 @@ def mark_result(url: str, status: str, error: str | None = None,
             "SELECT title, tailored_resume_path FROM jobs WHERE url = ?", (url,),
         ).fetchone()
         if row and row["tailored_resume_path"]:
-            source = Path(row["tailored_resume_path"])
+            source = (
+                config.RESUME_PDF_PATH
+                if config.application_resume_mode() == "master"
+                else Path(row["tailored_resume_path"])
+            )
             source = source.with_suffix(".pdf") if source.suffix.casefold() == ".txt" else source
             if source.is_file():
                 config.APPLIED_RESUME_DIR.mkdir(parents=True, exist_ok=True)
@@ -1735,6 +1752,9 @@ def mark_result(url: str, status: str, error: str | None = None,
                 try:
                     shutil.copy2(source, archived)
                     applied_resume_path = str(archived)
+                    tailored_docx = Path(row["tailored_resume_path"]).with_suffix(".docx")
+                    if tailored_docx.is_file():
+                        shutil.copy2(tailored_docx, archived.with_suffix(".docx"))
                 except OSError:
                     logger.warning("Could not archive applied resume %s", source, exc_info=True)
         conn.execute("""
@@ -2054,7 +2074,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             upload_watch_thread.start()
             upload_watch_ready.wait(timeout=15)
 
-        if agent == "codex" and dry_run and browser_mode == "managed":
+        if dry_run and browser_mode == "managed":
             dry_guard_stop = threading.Event()
             dry_guard_ready = threading.Event()
             dry_guard_thread = threading.Thread(

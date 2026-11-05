@@ -104,7 +104,7 @@ class WorkerSupervisorTests(unittest.TestCase):
                 "run-worker", "--max-spend", "5.00",
                 "--target-applied", "25", "--queue-threshold", "9",
                 "--discover-interval", "600", "--replenish-poll-interval", "30",
-                "--dry-run", "--skip-smart-extract",
+                "--dry-run", "--test-limit", "1", "--skip-smart-extract",
             ])
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertEqual(run.call_args.kwargs["max_spend_usd"], 5.00)
@@ -113,6 +113,7 @@ class WorkerSupervisorTests(unittest.TestCase):
         self.assertEqual(run.call_args.kwargs["discover_interval"], 600)
         self.assertEqual(run.call_args.kwargs["replenish_poll_interval"], 30)
         self.assertTrue(run.call_args.kwargs["dry_run"])
+        self.assertEqual(run.call_args.kwargs["test_limit"], 1)
         self.assertFalse(run.call_args.kwargs["smart_extract"])
 
     def test_run_worker_cli_requires_max_spend(self):
@@ -157,6 +158,32 @@ class WorkerSupervisorTests(unittest.TestCase):
         from selfapply.worker_supervisor import run_worker_supervisor
         with self.assertRaises(ValueError):
             run_worker_supervisor(max_spend_usd=None)
+
+    def test_test_run_stops_after_one_successful_dry_form_check(self):
+        from selfapply.worker_supervisor import run_worker_supervisor
+
+        def run_launcher(**kwargs):
+            self.assertTrue(kwargs["dry_run"])
+            self.assertTrue(kwargs["stop_condition"]())
+
+        fake_thread = Mock()
+        with (
+            patch("selfapply.worker_supervisor.config.ensure_dirs"),
+            patch("selfapply.worker_supervisor.database.init_db"),
+            patch("selfapply.worker_supervisor.threading.Thread", return_value=fake_thread),
+            patch("selfapply.worker_supervisor.launcher.main", side_effect=run_launcher),
+            patch("selfapply.worker_supervisor.launcher._stop_event", threading.Event()),
+            patch("selfapply.worker_supervisor.get_totals", return_value={
+                "applied": 1, "failed": 0, "cost": 0,
+            }),
+            patch("selfapply.worker_supervisor._set_stop_reason") as reason,
+            patch("selfapply.worker_supervisor._write_summary"),
+            patch("selfapply.worker_supervisor.add_event"),
+        ):
+            run_worker_supervisor(
+                max_spend_usd=5, dry_run=True, test_limit=1,
+            )
+        reason.assert_any_call("test_run_complete")
 
     def test_pdf_pending_count_stops_when_outputs_exist(self):
         with tempfile.TemporaryDirectory() as root:

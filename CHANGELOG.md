@@ -5,6 +5,26 @@ All notable changes to SelfApply will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-11-04
+
+### Added
+- Local Control Center with guided onboarding and readiness checks
+- Isolated multi-profile support for up to five candidate profiles
+- Guarded worker controls, queue replenishment, spending caps, and retry tools
+- Layout-preserving DOCX/PDF resume tailoring with manifests and integrity checks
+- OpenAI, Anthropic, Gemini, and local OpenAI-compatible provider setup
+- Sanitized product screenshots and public-release regression tests
+
+### Changed
+- Codex is the default browser agent, with Claude as an optional fallback
+- Resume tailoring now applies anchored edits and validates preserved facts
+- Secrets are write-only in the UI and stored only in the selected local profile
+
+### Security
+- SelfApply does not install or enable a login-time application worker
+- Example configuration contains placeholders only and no password value
+- Runtime profiles, resumes, databases, logs, and worker sessions remain Git-ignored
+
 ## [0.2.0] - 2026-02-17
 
 ### Added

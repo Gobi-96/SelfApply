@@ -1,5 +1,6 @@
 """Regression checks for publishing SelfApply without candidate data."""
 
+import json
 from pathlib import Path
 import re
 import subprocess
@@ -37,3 +38,13 @@ def test_repository_does_not_track_runtime_candidate_artifacts() -> None:
         if path and Path(path).name.casefold() in forbidden_names
     }
     assert not leaked, f"runtime candidate artifacts are tracked: {sorted(leaked)}"
+
+
+def test_public_example_contains_no_saved_password() -> None:
+    example = json.loads((ROOT / "profile.example.json").read_text(encoding="utf-8"))
+    assert "password" not in example.get("personal", {})
+
+
+def test_documentation_screenshots_are_packaged() -> None:
+    assert (ROOT / "docs/images/selfapply-onboarding.jpg").is_file()
+    assert (ROOT / "docs/images/selfapply-profile.jpg").is_file()

@@ -6,8 +6,13 @@ import shutil
 import json
 from pathlib import Path
 
-# User data directory — all user-specific files live here
-APP_DIR = Path(os.environ.get("SELFAPPLY_DIR", Path.home() / ".selfapply"))
+from selfapply import profiles
+
+# Shared metadata lives in ROOT_DIR; private job-search data lives in APP_DIR.
+# Worker subprocesses receive SELFAPPLY_DIR explicitly, while the UI resolves
+# the active profile from the registry on startup.
+ROOT_DIR = profiles.root_dir()
+APP_DIR = Path(os.environ["SELFAPPLY_DIR"]) if os.environ.get("SELFAPPLY_DIR") else profiles.active_data_dir(ROOT_DIR)
 
 # Core paths
 DB_PATH = APP_DIR / "selfapply.db"
@@ -15,6 +20,9 @@ PROFILE_PATH = APP_DIR / "profile.json"
 RESUME_PATH = APP_DIR / "resume.txt"
 RESUME_PDF_PATH = APP_DIR / "resume.pdf"
 RESUME_DOCX_PATH = APP_DIR / "resume.docx"
+RESUME_LAYOUT_PATH = APP_DIR / "resume-layout.json"
+RESUME_SOURCE_PATH = APP_DIR / "resume-source.json"
+RESUME_MANIFEST_PATH = APP_DIR / "resume-manifest.json"
 SEARCH_CONFIG_PATH = APP_DIR / "searches.yaml"
 ENV_PATH = APP_DIR / ".env"
 
@@ -154,6 +162,21 @@ def load_profile() -> dict:
             f"Profile not found at {PROFILE_PATH}. Run `selfapply init` first."
         )
     return json.loads(PROFILE_PATH.read_text(encoding="utf-8"))
+
+
+def application_resume_mode(profile: dict | None = None) -> str:
+    """Return the resume source selected for automatic applications."""
+    if profile is not None:
+        data = profile
+    else:
+        try:
+            data = load_profile()
+        except (FileNotFoundError, json.JSONDecodeError, AttributeError):
+            data = {}
+    mode = str(data.get("resume_preferences", {}).get(
+        "application_mode", "tailored",
+    )).strip().casefold()
+    return "master" if mode == "master" else "tailored"
 
 
 def load_search_config() -> dict:

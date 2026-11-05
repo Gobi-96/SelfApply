@@ -59,6 +59,156 @@ def test_worker_arguments_include_guardrails():
     assert Path(args[0]) == expected
 
 
+def test_test_run_arguments_fill_one_job_without_submission():
+    args = control_server.build_test_program_arguments(
+        control_server.validate_start_payload(valid_payload(agent="claude"))
+    )
+    assert args[1] == "run-worker"
+    assert "--dry-run" in args
+    assert args[args.index("--test-limit") + 1] == "1"
+    assert args[args.index("--workers") + 1] == "1"
+    assert args[args.index("--agent") + 1] == "claude"
+
+
+def test_start_test_run_requires_a_ready_job_and_is_one_shot():
+    with (
+        patch.object(control_server, "service_running", return_value=False),
+        patch.object(control_server, "settings_snapshot", return_value={}),
+        patch.object(control_server, "setup_readiness", return_value={
+            "complete": True, "missing": [],
+        }),
+        patch.object(control_server, "ensure_browser_runtime"),
+        patch.object(control_server, "_install_worker_service") as install,
+    ):
+        result = control_server.start_test_run(valid_payload())
+    assert result["ok"] is True
+    assert "final submission blocked" in result["message"]
+    assert "--dry-run" in install.call_args.args[0]
+    assert install.call_args.kwargs["continuous"] is False
+
+
+def test_self_apply_ui_exposes_clear_no_submit_test_run():
+    html = control_server.HTML
+    assert 'id="testRunButton"' in html
+    assert "Test one application — no submit" in html
+    assert "/api/worker/test-run" in html
+    assert "A browser-level safety guard blocks the final Submit button." in html
+    launcher_source = (
+        Path(control_server.__file__).with_name("apply") / "launcher.py"
+    ).read_text(encoding="utf-8")
+    assert 'if dry_run and browser_mode == "managed":' in launcher_source
+
+
+def test_self_apply_ui_offers_master_resume_mode_and_project_links():
+    html = control_server.HTML
+    assert 'id="useMasterResume"' in html
+    assert "Use my master resume for every application" in html
+    assert "saveApplicationResumeMode()" in html
+    assert "https://github.com/Gobi-96" in html
+    assert "https://github.com/Gobi-96/SelfApply/issues" in html
+    assert "https://github.com/sponsors/Gobi-96" in html
+    assert "\u00e9" not in html
+
+
+def test_document_vault_lists_master_and_all_tailored_formats(tmp_path):
+    master_pdf = tmp_path / "resume.pdf"
+    source = tmp_path / "resume-source.json"
+    tailored = tmp_path / "tailored"
+    master_pdf.write_bytes(b"%PDF-1.4 master")
+    source.write_text(json.dumps({
+        "name": "My Original Resume.pdf", "format": ".pdf",
+    }))
+    tailored.mkdir()
+    text = tailored / "company_role.txt"
+    text.write_text("resume")
+    text.with_suffix(".pdf").write_bytes(b"%PDF-1.4 tailored")
+    text.with_suffix(".docx").write_bytes(b"PK word")
+    text.with_name("company_role_REPORT.json").write_text(json.dumps({
+        "changes": [{"section": "summary", "before": "Old", "after": "New"}],
+    }))
+    connection = Mock()
+    connection.execute.return_value.fetchall.return_value = [{
+        "title": "Product Manager", "tailored_resume_path": str(text),
+    }]
+    with (
+        patch.object(control_server.config, "RESUME_SOURCE_PATH", source),
+        patch.object(control_server.config, "RESUME_PDF_PATH", master_pdf),
+        patch.object(control_server.config, "RESUME_DOCX_PATH", tmp_path / "resume.docx"),
+        patch.object(control_server.config, "RESUME_PATH", tmp_path / "resume.txt"),
+        patch.object(control_server.config, "TAILORED_DIR", tailored),
+        patch.object(control_server.database, "get_connection", return_value=connection),
+    ):
+        result = control_server.document_vault_files()
+    assert result["master"]["name"] == "My Original Resume.pdf"
+    assert result["master"]["view"].endswith("format=pdf&view=1")
+    assert result["master"]["download"].endswith("format=pdf")
+    assert result["documents"][0]["name"] == "Product Manager"
+    assert result["documents"][0]["pdf_view"].endswith("&view=1")
+    assert result["documents"][0]["docx"].endswith("company_role.docx")
+    assert result["documents"][0]["compare_name"] == "company_role"
+    assert "txt" not in result["documents"][0]
+
+
+def test_resume_change_report_returns_only_real_changes(tmp_path):
+    tailored = tmp_path / "tailored"
+    tailored.mkdir()
+    (tailored / "company_role_REPORT.json").write_text(json.dumps({
+        "format_fidelity": "exact-structure",
+        "changes": [
+            {"section": "summary", "before": "Old summary", "after": "New summary"},
+            {"section": "skills", "before": "Python", "after": "Python"},
+        ],
+    }))
+    with patch.object(control_server.config, "TAILORED_DIR", tailored):
+        result = control_server.resume_change_report("company_role")
+    assert result["changed_block_count"] == 1
+    assert result["changes"][0] == {
+        "section": "summary", "before": "Old summary", "after": "New summary",
+        "page": None, "rect": None,
+    }
+    with patch.object(control_server.config, "TAILORED_DIR", tailored):
+        with pytest.raises(ValueError, match="Invalid"):
+            control_server.resume_change_report("../company_role")
+
+
+def test_document_vault_ui_has_view_and_download_controls():
+    html = control_server.HTML
+    assert 'id="masterDocument"' in html
+    assert "View ${esc(label)}" in html
+    assert "Download ${esc(label)}" in html
+    assert "documentView(master.view,master.format)" in html
+    assert "documentDownload(x.docx,'Word')" in html
+    assert "Download TXT" not in html
+    assert "/api/resumes/changes" in html
+    assert 'class="diff-line removed"' in html
+    assert 'class="diff-line added"' in html
+    assert "showResumeCompareMode('unified')" in html
+    assert "showResumeCompareMode('split')" in html
+    assert "showResumeCompareMode('pdf')" in html
+    assert "/api/resumes/preview" in html
+    assert 'class="pdf-page"' in html
+
+
+def test_resume_preview_info_lists_every_full_pdf_page(tmp_path):
+    import fitz
+
+    tailored = tmp_path / "tailored"
+    tailored.mkdir()
+    pdf = tailored / "role.pdf"
+    document = fitz.open()
+    for text in ("Complete first page", "Complete second page"):
+        page = document.new_page()
+        page.insert_text((72, 72), text)
+    document.save(pdf)
+    document.close()
+    with patch.object(control_server.config, "TAILORED_DIR", tailored):
+        result = control_server.resume_preview_info("role.pdf", "tailored")
+    assert result["page_count"] == 2
+    assert len(result["pages"]) == 2
+    assert len(result["sizes"]) == 2
+    assert result["pages"][1].endswith("kind=tailored&name=role.pdf&page=1")
+
+
 def test_portals_include_six_boards_and_one_representative_workday():
     queued = {
         "brookfield.wd5.myworkdayjobs.com":
@@ -80,10 +230,11 @@ def test_start_repairs_plist_and_refuses_duplicate(tmp_path):
         patch.object(control_server, "PLIST_PATH", plist),
         patch.object(control_server, "service_running", return_value=False),
         patch.object(control_server, "settings_snapshot", return_value={}),
-        patch.object(control_server, "setup_readiness", return_value={
-            "complete": True, "missing": [],
-        }),
-        patch.object(control_server, "_launchctl", return_value=completed) as launch,
+            patch.object(control_server, "setup_readiness", return_value={
+                "complete": True, "missing": [],
+            }),
+            patch.object(control_server, "ensure_browser_runtime", return_value={"ready": True}),
+            patch.object(control_server, "_launchctl", return_value=completed) as launch,
         patch.object(control_server.subprocess, "run", return_value=completed),
     ):
         result = control_server.start_worker(valid_payload())
@@ -172,6 +323,24 @@ def test_loaded_worker_is_detected_between_keepalive_restarts(tmp_path):
     ):
         assert control_server.service_running() is True
         assert control_server._active_service_label() == control_server.LABEL
+
+
+def test_successfully_finished_restart_on_failure_service_is_not_running(tmp_path):
+    loaded = control_server.subprocess.CompletedProcess(
+        [], 0, "active count = 0\nstate = not running\nlast exit code = 0", "",
+    )
+    plist = tmp_path / "worker.plist"
+    plist.write_bytes(control_server.plistlib.dumps({
+        "KeepAlive": {"SuccessfulExit": False},
+    }))
+    with (
+        patch.object(control_server.platform, "system", return_value="Darwin"),
+        patch.object(control_server, "_launchctl", return_value=loaded),
+        patch.object(control_server, "PLIST_PATH", plist),
+        patch.object(control_server, "_managed_worker_pids", return_value=[]),
+    ):
+        assert control_server._active_service_label() is None
+        assert control_server.service_running() is False
 
 
 def test_completed_one_shot_worker_is_not_reported_as_running(tmp_path):
@@ -307,10 +476,10 @@ def test_connected_google_goes_directly_to_portal_without_account_check(tmp_path
 
 
 def test_ui_offers_connect_all_google_and_manual_login_without_credential_fields():
-    assert "Connect remaining with Google" in control_server.HTML
-    assert "Connect with Google" in control_server.HTML
-    assert "Manual login" in control_server.HTML
-    assert "Unlink" in control_server.HTML
+    assert "Connect enabled sites with Google" in control_server.HTML
+    assert "Use Google" in control_server.HTML
+    assert "Sign in manually" in control_server.HTML
+    assert "Disconnect" in control_server.HTML
     assert "Stop connecting" in control_server.HTML
     assert "post('/api/connections/manual',{name:n})" in control_server.HTML
 
@@ -318,10 +487,11 @@ def test_ui_offers_connect_all_google_and_manual_login_without_credential_fields
 def test_google_connection_ui_reports_progress_and_prevents_duplicate_actions():
     html = control_server.HTML
     assert "googleBusy=busy&&c.action.kind==='Google sign-in'" in html
-    assert "googleBusy?'Connecting…':'Connect'" in html
+    assert "googleBusy?'Opening Google…':agentBusy?'Connect Google instead':g.stale?'Reconnect Google':'Connect Google account'" in html
+    assert "The previous Google session is no longer authenticated." in html
     assert "${busy?'disabled':''}" in html
     assert "portalBusy=busy&&" in html
-    assert "portalBusy?'Connecting…':'Connect with Google'" in html
+    assert "portalBusy?'Connecting…':'Use Google'" in html
 
 
 def test_google_connection_wait_can_be_cancelled(tmp_path):
@@ -337,7 +507,7 @@ def test_google_connection_wait_can_be_cancelled(tmp_path):
 
     with (
         patch.object(control_server.config, "APP_DIR", tmp_path),
-        patch.object(controller, "begin", side_effect=lambda kind, task: {"result": task()}),
+        patch.object(controller, "begin", side_effect=lambda kind, task, **_kwargs: {"result": task()}),
         patch("selfapply.cli._managed_connect_browser", side_effect=browser),
         patch("selfapply.apply.launcher.check_google_session", return_value=(False, None)),
         patch("selfapply.apply.launcher.wait_for_google_signin", side_effect=wait),
@@ -347,37 +517,28 @@ def test_google_connection_wait_can_be_cancelled(tmp_path):
     assert result["result"] == "Google sign-in stopped."
 
 
-def test_google_connection_can_verify_existing_chrome_without_managed_browser(tmp_path):
+def test_web_google_connection_rejects_existing_chrome_mode(tmp_path):
     controller = control_server.Controller()
-    with (
-        patch.object(control_server.config, "APP_DIR", tmp_path),
-        patch.object(controller, "begin", side_effect=lambda kind, task: {"result": task()}),
-        patch("selfapply.cli._managed_connect_browser") as managed,
-        patch(
-            "selfapply.apply.launcher.check_google_with_browser_agent",
-            return_value=(True, "person@example.com"),
-        ),
-    ):
-        result = controller.connect_google("existing")
-
-    assert "existing Chrome" in result["result"]
-    managed.assert_not_called()
-    saved = json.loads((tmp_path / "google_session.json").read_text())
-    assert saved["browser_mode"] == "existing"
+    with pytest.raises(ValueError, match="managed Chrome"):
+        controller.connect_google("existing")
 
 
-def test_connections_ui_defaults_to_existing_chrome_and_sends_mode():
+def test_connections_ui_uses_managed_chrome_without_a_mode_selector():
     html = control_server.HTML
     assert 'id="connectionBrowser"' in html
-    assert "selfapply-connection-browser')||'existing'" in html
-    assert "'/api/connections/google',{browser:val('connectionBrowser')}" in html
+    assert '<select id="connectionBrowser"' not in html
+    assert '<select id="browserMode"' not in html
+    assert "connectionBrowser.value='managed';browserMode.value='managed'" in html
+    assert "function chooseBrowserMode(value)" not in html
+    assert "'/api/connections/google',{browser:'managed'}" in html
     assert "name:n,browser:val('connectionBrowser')" in html
 
 
 def test_ui_has_light_default_dark_theme_and_accessible_responsive_shell():
     html = control_server.HTML
     assert "localStorage.getItem('selfapply-theme')||'light'" in html
-    assert 'class="sidebar-theme"' in html
+    assert 'id="themeLight"' in html
+    assert 'class="profile-switcher"' in html
     assert "toggleTheme()" in html
     assert 'html[data-theme="dark"]' in html
     assert 'aria-label="Open navigation"' in html
@@ -418,8 +579,9 @@ def test_connect_all_skips_already_connected_portals(tmp_path):
         "verified": True, "email": "person@example.com",
     }))
     rows = [
-        {"name": "Dice", "status": "connected"},
-        {"name": "LinkedIn", "status": "failed:login_required"},
+        {"name": "Dice", "status": "connected", "enabled": True},
+        {"name": "LinkedIn", "status": "failed:login_required", "enabled": True},
+        {"name": "Glassdoor", "status": "not_tested", "enabled": False},
     ]
 
     @contextmanager
@@ -455,6 +617,59 @@ def test_cancel_and_unlink_are_explicit_local_operations(tmp_path):
         result = controller.unlink("Google")
     assert result["ok"] is True
     assert not (tmp_path / "google_session.json").exists()
+
+
+def test_abandoned_browser_agent_connection_can_be_replaced():
+    controller = control_server.Controller()
+    first_started = threading.Event()
+
+    def abandoned_login():
+        cancel_event = controller.cancel_event
+        first_started.set()
+        cancel_event.wait(5)
+        return "Codex account connection cancelled."
+
+    controller.begin("Connect Codex account", abandoned_login)
+    assert first_started.wait(1)
+    result = controller.begin(
+        "Connect Claude account",
+        lambda: "Claude account connected.",
+        replace_kinds=("Connect Codex account", "Connect Claude account"),
+    )
+    assert result["ok"] is True
+    deadline = time.monotonic() + 1
+    while controller.action.running and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert controller.action.kind == "Connect Claude account"
+    assert controller.action.message == "Claude account connected."
+
+
+def test_browser_agent_connect_marks_other_agent_login_as_replaceable():
+    controller = control_server.Controller()
+    with (
+        patch.object(control_server.shutil, "which", return_value="/usr/bin/agent"),
+        patch.object(controller, "begin", return_value={"ok": True}) as begin,
+    ):
+        controller.connect_browser_agent("codex")
+    assert begin.call_args.kwargs["replace_kinds"] == (
+        "Connect Codex account", "Connect Claude account",
+    )
+
+
+def test_google_connect_can_replace_abandoned_browser_agent_login():
+    controller = control_server.Controller()
+    with patch.object(controller, "begin", return_value={"ok": True}) as begin:
+        controller.connect_google()
+    assert begin.call_args.kwargs["replace_kinds"] == (
+        "Connect Codex account", "Connect Claude account",
+    )
+
+
+def test_google_button_explains_and_replaces_pending_agent_login():
+    html = control_server.HTML
+    assert "Connect Google instead" in html
+    assert "Connecting Google will cancel it." in html
+    assert "busy&&!agentBusy?'disabled':''" in html
 
 
 def test_settings_snapshot_never_returns_saved_secrets(tmp_path):
@@ -499,6 +714,7 @@ def test_profile_settings_save_to_wizard_file_and_preserve_advanced_facts(tmp_pa
         "experience": {}, "availability": {}, "eeo_voluntary": {},
         "skills_boundary": {"tools": "Git, Docker"},
         "resume_facts": {"preserved_companies": "Example, Other"},
+        "resume_preferences": {"application_mode": "master"},
     }
     with patch.object(control_server.config, "PROFILE_PATH", profile):
         control_server.save_profile_settings(payload)
@@ -507,6 +723,7 @@ def test_profile_settings_save_to_wizard_file_and_preserve_advanced_facts(tmp_pa
     assert saved["resume_facts"]["experience_entries"] == [{"company": "Example"}]
     assert saved["resume_facts"]["preserved_companies"] == ["Example", "Other"]
     assert saved["skills_boundary"]["tools"] == ["Git", "Docker"]
+    assert saved["resume_preferences"]["application_mode"] == "master"
 
 
 def test_ai_settings_are_write_only_and_preserve_unedited_optional_secret(tmp_path):
@@ -581,6 +798,7 @@ def test_reset_moves_local_data_to_private_backup_and_reinitializes(tmp_path):
         patch.object(control_server, "database_status", return_value={
             "counts": {"applied": 12, "failed": 3},
         }),
+        patch.object(control_server, "logout_browser_agents", return_value=[]),
     ):
         result = control_server.reset_local_data({"confirmation": "RESET"})
     backup = Path(result["backup"])
@@ -591,6 +809,200 @@ def test_reset_moves_local_data_to_private_backup_and_reinitializes(tmp_path):
     assert (tmp_path / "control-token").read_text() == "keep"
     assert paths["DB_PATH"].exists()
     assert not paths["PROFILE_PATH"].exists()
+    assert not paths["ENV_PATH"].exists()
+
+
+def test_restore_lists_and_restores_a_reset_backup(tmp_path):
+    app_dir = tmp_path / "profiles" / "profile-b"
+    app_dir.mkdir(parents=True)
+    (tmp_path / "profiles.json").write_text(json.dumps({
+        "version": 1,
+        "active_profile_id": "profile-b",
+        "profiles": [
+            {"id": "profile-a", "name": "Original profile"},
+            {"id": "profile-b", "name": "Current profile"},
+        ],
+    }), encoding="utf-8")
+    paths = {
+        "ROOT_DIR": tmp_path,
+        "APP_DIR": app_dir,
+        "DB_PATH": app_dir / "selfapply.db",
+        "PROFILE_PATH": app_dir / "profile.json",
+        "RESUME_PATH": app_dir / "resume.txt",
+        "RESUME_PDF_PATH": app_dir / "resume.pdf",
+        "RESUME_DOCX_PATH": app_dir / "resume.docx",
+        "SEARCH_CONFIG_PATH": app_dir / "searches.yaml",
+        "ENV_PATH": app_dir / ".env",
+        "TAILORED_DIR": app_dir / "tailored_resumes",
+        "APPLIED_RESUME_DIR": app_dir / "applied_resumes",
+        "COVER_LETTER_DIR": app_dir / "cover_letters",
+        "LOG_DIR": app_dir / "logs",
+        "CHROME_WORKER_DIR": app_dir / "chrome-workers",
+        "APPLY_WORKER_DIR": app_dir / "apply-workers",
+    }
+    backup = tmp_path / "backups" / "profile-a" / "reset-20260901-120000"
+    backup.mkdir(parents=True)
+    (backup / "profile.json").write_text(
+        '{"personal":{"full_name":"Restored User"}}', encoding="utf-8",
+    )
+    (backup / ".env").write_text("OPENAI_API_KEY=restored\n", encoding="utf-8")
+    (backup / "searches.yaml").write_text("location: Remote\n", encoding="utf-8")
+    (backup / "resume.pdf").write_bytes(b"restored-master-pdf")
+    (backup / "google_session.json").write_text('{"verified":true}', encoding="utf-8")
+    (backup / "browser-agent-links.json").write_text(
+        '{"codex":{"linked":true}}', encoding="utf-8",
+    )
+    (backup / "chrome-workers" / "worker-0").mkdir(parents=True)
+    (backup / "chrome-workers" / "worker-0" / "Cookies").write_bytes(b"portal-session")
+    (backup / "reset-manifest.json").write_text(json.dumps({
+        "created_at": "2026-09-01T12:00:00+00:00",
+        "reason": "User-requested SelfApply reset",
+        "profile_id": "profile-a",
+        "profile_name": "Original profile",
+        "counts": {"applied": 9},
+    }), encoding="utf-8")
+    (app_dir / "profile.json").write_text(
+        '{"personal":{"full_name":"Current User"}}', encoding="utf-8",
+    )
+    with (
+        patch.multiple(control_server.config, **paths),
+        patch.object(database, "DB_PATH", paths["DB_PATH"]),
+        patch.object(control_server, "service_running", return_value=False),
+    ):
+        listing = control_server.available_profile_backups()
+        result = control_server.restore_profile_backup({
+            "backup_id": f"profile-a/{backup.name}", "confirmation": "RESTORE",
+        })
+    assert listing["backups"][0]["counts"]["applied"] == 9
+    assert listing["backups"][0]["source_profile"] == "Original profile"
+    assert result["restart"] is True
+    assert json.loads(paths["PROFILE_PATH"].read_text())["personal"]["full_name"] == "Restored User"
+    assert paths["ENV_PATH"].read_text() == "OPENAI_API_KEY=restored\n"
+    assert paths["SEARCH_CONFIG_PATH"].read_text() == "location: Remote\n"
+    assert paths["RESUME_PDF_PATH"].read_bytes() == b"restored-master-pdf"
+    assert (app_dir / "google_session.json").read_text() == '{"verified":true}'
+    assert json.loads((app_dir / "browser-agent-links.json").read_text())["codex"]["linked"] is True
+    assert (app_dir / "chrome-workers" / "worker-0" / "Cookies").read_bytes() == b"portal-session"
+    registry = json.loads((tmp_path / "profiles.json").read_text())
+    restored_entry = next(item for item in registry["profiles"] if item["id"] == "profile-b")
+    assert restored_entry["name"] == "Original profile"
+    recovery = tmp_path / "backups" / "profile-b" / result["recovery_backup"]
+    assert json.loads((recovery / "profile.json").read_text())["personal"]["full_name"] == "Current User"
+
+
+def test_restore_rejects_unknown_or_unconfirmed_backup(tmp_path):
+    with (
+        patch.object(control_server.config, "ROOT_DIR", tmp_path),
+        patch.object(control_server.config, "APP_DIR", tmp_path / "active"),
+        pytest.raises(ValueError, match="RESTORE"),
+    ):
+        control_server.restore_profile_backup({"backup_id": "missing"})
+
+
+def test_restore_link_validation_allows_internal_runtime_and_stale_chrome_links(tmp_path):
+    runtime = tmp_path / "node-runtime"
+    runtime.mkdir()
+    target = runtime / "cli.js"
+    target.write_text("runtime", encoding="utf-8")
+    try:
+        (runtime / "playwright").symlink_to("cli.js")
+        (tmp_path / "SingletonSocket").symlink_to("/tmp/old-chrome-socket")
+    except OSError:
+        pytest.skip("Symbolic links are unavailable on this platform")
+    control_server._validate_backup_links(tmp_path)
+    assert "SingletonSocket" in control_server._restore_copy_ignore(
+        str(tmp_path), ["SingletonSocket", "Preferences"],
+    )
+
+
+def test_restore_link_validation_rejects_external_links(tmp_path):
+    outside = tmp_path.parent / "outside-secret"
+    outside.write_text("secret", encoding="utf-8")
+    try:
+        (tmp_path / "external").symlink_to(outside)
+    except OSError:
+        pytest.skip("Symbolic links are unavailable on this platform")
+    with pytest.raises(ValueError, match="unsafe external link"):
+        control_server._validate_backup_links(tmp_path)
+
+
+def test_profile_reset_does_not_disconnect_host_wide_browser_agents(tmp_path):
+    paths = {
+        "APP_DIR": tmp_path,
+        "DB_PATH": tmp_path / "selfapply.db",
+        "PROFILE_PATH": tmp_path / "profile.json",
+        "RESUME_PATH": tmp_path / "resume.txt",
+        "RESUME_PDF_PATH": tmp_path / "resume.pdf",
+        "RESUME_DOCX_PATH": tmp_path / "resume.docx",
+        "SEARCH_CONFIG_PATH": tmp_path / "searches.yaml",
+        "ENV_PATH": tmp_path / ".env",
+        "TAILORED_DIR": tmp_path / "tailored_resumes",
+        "APPLIED_RESUME_DIR": tmp_path / "applied_resumes",
+        "COVER_LETTER_DIR": tmp_path / "cover_letters",
+        "LOG_DIR": tmp_path / "logs",
+        "CHROME_WORKER_DIR": tmp_path / "chrome-workers",
+        "APPLY_WORKER_DIR": tmp_path / "apply-workers",
+    }
+    (tmp_path / ".env").write_text("OPENAI_API_KEY=sk-example\n")
+    (tmp_path / "google_session.json").write_text('{"verified":true}')
+    with (
+        patch.multiple(control_server.config, **paths),
+        patch.object(database, "DB_PATH", paths["DB_PATH"]),
+        patch.object(control_server, "service_running", return_value=False),
+        patch.object(control_server, "database_status", return_value={"counts": {}}),
+        patch.object(control_server, "logout_browser_agents", return_value=["Codex", "Claude"]) as logout,
+    ):
+        result = control_server.reset_local_data({"confirmation": "RESET"})
+    logout.assert_not_called()
+    assert result["ok"] is True
+    assert not paths["ENV_PATH"].exists()
+    assert not (tmp_path / "google_session.json").exists()
+
+
+def test_extension_verification_is_bound_to_the_saved_token(tmp_path):
+    env = tmp_path / ".env"
+    state = tmp_path / "chrome-extension-test.json"
+    env.write_text("PLAYWRIGHT_MCP_EXTENSION_TOKEN=first-token\n")
+    state.write_text(json.dumps({
+        "token_hash": control_server.hashlib.sha256(b"first-token").hexdigest(),
+    }))
+    with (
+        patch.object(control_server.config, "ENV_PATH", env),
+        patch.object(control_server, "EXTENSION_TEST_PATH", state),
+    ):
+        assert control_server.extension_connection_verified() is True
+        env.write_text("PLAYWRIGHT_MCP_EXTENSION_TOKEN=replaced-token\n")
+        assert control_server.extension_connection_verified() is False
+
+
+def test_live_extension_test_records_verification(tmp_path):
+    env = tmp_path / ".env"
+    state = tmp_path / "chrome-extension-test.json"
+    env.write_text("PLAYWRIGHT_MCP_EXTENSION_TOKEN=test-token\n")
+    with (
+        patch.object(control_server.config, "ENV_PATH", env),
+        patch.object(control_server, "EXTENSION_TEST_PATH", state),
+        patch.object(control_server, "service_running", return_value=False),
+        patch.object(control_server, "browser_agent_status", return_value={
+            "codex": {"authenticated": True},
+        }),
+        patch("selfapply.apply.launcher._run_one_shot_browser_agent",
+              return_value="RESULT:EXTENSION_CONNECTED"),
+    ):
+        result = control_server.test_chrome_extension()
+        assert result["ok"] is True
+        assert control_server.extension_connection_verified() is True
+
+
+def test_existing_chrome_is_not_available_from_web_worker_controls(tmp_path):
+    env = tmp_path / ".env"
+    env.write_text("PLAYWRIGHT_MCP_EXTENSION_TOKEN=untested\n")
+    with (
+        patch.object(control_server.config, "ENV_PATH", env),
+        patch.object(control_server, "EXTENSION_TEST_PATH", tmp_path / "missing.json"),
+        pytest.raises(ValueError, match="uses managed Chrome"),
+    ):
+        control_server.validate_start_payload(valid_payload(browser="existing"))
 
 
 def test_control_center_has_first_run_onboarding_and_reset_controls():
@@ -598,10 +1010,28 @@ def test_control_center_has_first_run_onboarding_and_reset_controls():
     assert 'id="onboardingProgress"' in control_server.HTML
     assert 'data-tab="settings"' in control_server.HTML
     assert "/api/settings/reset" in control_server.HTML
+    assert "/api/settings/backups" in control_server.HTML
+    assert "/api/settings/backup/restore" in control_server.HTML
+    assert "Restore from a backup" in control_server.HTML
     assert 'class="app-loader"' in control_server.HTML
     assert "function advanceOnboarding()" in control_server.HTML
     assert "document.body.classList.remove('booting')" in control_server.HTML
     assert control_server.HTML.count('class="nav-icon"><svg') == 8
+    assert 'id="primaryConnections"' in control_server.HTML
+    assert "Required automation" in control_server.HTML
+    assert "focusAutomation('ai')" in control_server.HTML
+    assert "focusAutomation('agent')" in control_server.HTML
+    assert "focusAutomation('runtime')" not in control_server.HTML
+    assert "of 2 ready" in control_server.HTML
+    assert "function organizeAutomationSettings()" in control_server.HTML
+    assert "Complete five essentials" in control_server.HTML
+    assert "Missing: ${esc(missingText)}" in control_server.HTML
+    assert "['connected-accounts','Google sign-in'" in control_server.HTML
+    assert "{confirmation,backup}" in control_server.HTML
+    assert "/api/profiles/create" in control_server.HTML
+    assert "Use my existing Chrome tab" not in control_server.HTML
+    assert "Test Chrome extension" not in control_server.HTML
+    assert "Install Chrome extension" not in control_server.HTML
 
 
 def test_ats_preference_patch_preserves_work_authorization(tmp_path):
@@ -632,9 +1062,11 @@ def test_search_settings_and_resume_upload_use_canonical_files(tmp_path):
     searches = tmp_path / "searches.yaml"
     searches.write_text("location:\n  accept_patterns: [Bay Area]\n")
     resume = tmp_path / "resume.txt"
+    profile = tmp_path / "profile.json"
     with (
         patch.object(control_server.config, "SEARCH_CONFIG_PATH", searches),
         patch.object(control_server.config, "RESUME_PATH", resume),
+        patch.object(control_server.config, "PROFILE_PATH", profile),
     ):
         control_server.save_search_settings({
             "location": "Oregon", "primary_location": "Portland, OR",
@@ -674,6 +1106,35 @@ def test_search_settings_accept_arbitrary_candidate_locations(tmp_path):
     assert saved["location"]["city"] == "Potsdam"
 
 
+def test_search_settings_supports_local_radius_plus_remote_mode(tmp_path):
+    searches = tmp_path / "searches.yaml"
+    searches.write_text("{}\n")
+    with patch.object(control_server.config, "SEARCH_CONFIG_PATH", searches):
+        control_server.save_search_settings({
+            "country": "United States", "state": "California", "city": "Fremont",
+            "distance": 50, "hours_old": 72, "results_per_site": 50,
+            "location_mode": "local_and_remote", "sites": [
+                "indeed", "linkedin", "glassdoor", "zip_recruiter", "google",
+            ],
+            "target_titles": "Solution Architect",
+        })
+    saved = control_server.yaml.safe_load(searches.read_text())
+    assert saved["location_mode"] == "local_and_remote"
+    assert saved["locations"] == [
+        {"location": "Fremont, California, United States", "remote": False},
+        {"location": "Remote", "remote": True},
+    ]
+    assert saved["defaults"]["distance"] == 50
+
+
+def test_job_preferences_defaults_missing_board_config_to_all_major_boards():
+    for board in ("indeed", "linkedin", "glassdoor", "zip_recruiter", "google"):
+        assert f"'{board}'" in control_server.HTML
+    assert "Object.prototype.hasOwnProperty.call(s,'sites')" in control_server.HTML
+    assert "Remote + on-site/hybrid within my radius" in control_server.HTML
+    assert "location_mode:val('s_location_mode')" in control_server.HTML
+
+
 def test_daily_activity_is_seven_applied_only_days():
     connection = Mock()
     connection.execute.return_value.fetchall.return_value = []
@@ -707,6 +1168,13 @@ def test_ui_has_separate_settings_tabs_and_complete_save_actions():
         assert f'id="{field}"' in control_server.HTML
 
 
+def test_resume_upload_starts_immediately_after_file_selection():
+    assert 'id="resumeFile" type="file" accept=".pdf,.docx,.txt" onchange="uploadResume()"' in control_server.HTML
+    assert "let resumeUploadRunning=false" in control_server.HTML
+    assert "Uploading ${f.name}…" in control_server.HTML
+    assert '>Upload and convert resume</button>' not in control_server.HTML
+
+
 def test_docx_resume_is_preserved_and_converted_to_plain_text(tmp_path):
     buffer = BytesIO()
     xml = b'''<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>Software Engineer</w:t></w:r></w:p><w:p><w:r><w:t>Python and TypeScript</w:t></w:r></w:p></w:body></w:document>'''
@@ -715,6 +1183,8 @@ def test_docx_resume_is_preserved_and_converted_to_plain_text(tmp_path):
     with (
         patch.object(control_server.config, "RESUME_DOCX_PATH", tmp_path / "resume.docx"),
         patch.object(control_server.config, "RESUME_PATH", tmp_path / "resume.txt"),
+        patch.object(control_server.config, "PROFILE_PATH", tmp_path / "profile.json"),
+        patch.object(control_server.config, "SEARCH_CONFIG_PATH", tmp_path / "searches.yaml"),
     ):
         result = control_server.save_resume({
             "name": "resume.docx",
@@ -747,12 +1217,38 @@ def test_settings_exposes_all_direct_boards_selected_by_default(tmp_path):
     assert discovery["workday"] is True
 
 
-def test_provider_specific_ui_includes_claude_custom_and_chrome_guidance():
+def test_ai_ui_auto_detects_provider_without_obsolete_extension_setup():
     assert "Claude / Anthropic" in control_server.HTML
-    assert "claude-sonnet-4-5" in control_server.HTML
-    assert "Custom model" in control_server.HTML
-    assert "Install Chrome extension" in control_server.HTML
-    assert "PLAYWRIGHT_MCP_EXTENSION_TOKEN" in control_server.HTML
+    assert "Enter an API key or local URL, then test the connection" in control_server.HTML
+    assert "Test connection" in control_server.HTML
+    assert "Save connection" in control_server.HTML
+    assert "/api/settings/ai/probe" in control_server.HTML
+    assert "Install Chrome extension" not in control_server.HTML
+    assert "PLAYWRIGHT_MCP_EXTENSION_TOKEN" not in control_server.HTML
+
+
+def test_probe_ai_provider_detects_unsaved_key_without_persisting(tmp_path):
+    client = Mock()
+    client.ask.return_value = "SelfApply OK"
+    with (
+        patch.object(control_server.config, "ENV_PATH", tmp_path / ".env"),
+        patch("selfapply.llm.LLMClient", return_value=client),
+    ):
+        result = control_server.probe_ai_provider({"api_key": "sk-ant-example"})
+    assert result["provider"] == "anthropic"
+    assert result["model"] == "claude-haiku-4-5"
+    assert result["saved"] is False
+    assert not (tmp_path / ".env").exists()
+    client.close.assert_called_once()
+
+
+def test_removing_ai_connection_also_removes_local_url_and_model(tmp_path):
+    env = tmp_path / ".env"
+    env.write_text("LLM_URL=http://localhost:11434/v1\nLLM_MODEL=qwen\n")
+    with patch.object(control_server.config, "ENV_PATH", env):
+        control_server.delete_saved_secret("provider")
+    assert "LLM_URL" not in env.read_text()
+    assert "LLM_MODEL" not in env.read_text()
 
 
 def test_setup_readiness_marks_required_sections_and_can_complete():
@@ -839,16 +1335,141 @@ def test_browser_agent_test_and_unlink_controls_are_real():
     with (
         patch.object(control_server.shutil, "which", return_value="/usr/bin/codex"),
         patch.object(control_server.subprocess, "run", return_value=completed) as run,
+        patch.object(control_server, "_set_browser_agent_link") as set_link,
     ):
         assert controller.unlink_browser_agent("codex")["ok"] is True
     assert run.call_args.args[0] == ["codex", "logout"]
+    set_link.assert_called_once_with("codex", False)
 
 
-def test_browser_login_completion_refreshes_account_cards_and_verifies_auth():
-    assert "agentAction&&agentAction!==lastAgentAction" in control_server.HTML
+def test_connection_completion_refreshes_onboarding_and_verifies_browser_auth():
+    assert "completedConnectionAction&&completedConnectionAction!==lastConnectionAction" in control_server.HTML
+    assert "!busy&&c.action.kind" in control_server.HTML
     assert "await loadSettings()" in control_server.HTML
     source = open(control_server.__file__, encoding="utf-8").read()
-    assert 'browser_agent_status().get(name, {}).get("authenticated")' in source
+    assert 'browser_agent_status().get(name, {}).get("cli_authenticated")' in source
+    assert "_set_browser_agent_link(name, True)" in source
+
+
+def test_browser_agent_requires_selfapply_link_even_when_cli_is_logged_in(tmp_path):
+    links = tmp_path / "browser-agent-links.json"
+    completed = control_server.subprocess.CompletedProcess([], 0, "Logged in", "")
+    with (
+        patch.object(control_server, "BROWSER_AGENT_LINKS_PATH", links),
+        patch.object(control_server.shutil, "which", return_value="/usr/bin/agent"),
+        patch.object(control_server.subprocess, "run", return_value=completed),
+    ):
+        status = control_server.browser_agent_status()
+        assert status["codex"]["cli_authenticated"] is True
+        assert status["codex"]["authenticated"] is False
+        assert status["codex"]["linked"] is False
+        assert "link to SelfApply required" in status["codex"]["detail"]
+
+        control_server._set_browser_agent_link("codex", True)
+        status = control_server.browser_agent_status()
+        assert status["codex"]["authenticated"] is True
+        assert status["codex"]["linked"] is True
+
+
+def test_self_apply_agent_selector_uses_only_linked_accounts():
+    assert "function syncAgentChoices(agents)" in control_server.HTML
+    assert "Connect Codex or Claude first" in control_server.HTML
+    assert "applyAgent.disabled=linked.length<2" in control_server.HTML
+    assert "syncAgentChoices(agents);renderReadiness(d)" in control_server.HTML
+    assert "localStorage.setItem('selfapply-agent',applyAgent.value)" in control_server.HTML
+
+
+def test_playwright_runtime_is_internal_not_an_onboarding_field():
+    snapshot = {
+        "profile": {}, "searches": {}, "discovery": {}, "ai": {"provider": "none"},
+        "resume": {"text": False}, "browser_agent": {},
+        "browser_runtime": {"ready": False},
+    }
+    readiness = control_server.setup_readiness(snapshot)
+    assert "Playwright browser runtime" not in {
+        item["label"] for item in readiness["missing"]
+    }
+    assert 'id="browserRuntime" hidden aria-hidden="true"' in control_server.HTML
+    assert "/api/settings/browser-runtime/install" in control_server.HTML
+    assert "/api/settings/browser-runtime/test" in control_server.HTML
+
+
+def test_internal_browser_runtime_repairs_missing_packaged_chromium():
+    repaired = {"ready": True, "missing": []}
+    with (
+        patch.object(control_server, "browser_runtime_status", return_value={
+            "ready": False,
+            "python_package": True,
+            "missing": ["Playwright Chromium"],
+        }),
+        patch.object(control_server, "install_playwright_browser", return_value={
+            "ok": True, "runtime": repaired,
+        }) as install,
+    ):
+        assert control_server.ensure_browser_runtime() == repaired
+    install.assert_called_once_with()
+
+
+def test_playwright_runtime_test_launches_and_automates_a_page():
+    page = Mock()
+    page.title.return_value = "SelfApply browser check"
+    browser = Mock()
+    browser.new_page.return_value = page
+    playwright = Mock()
+    playwright.chromium.launch.return_value = browser
+
+    @contextmanager
+    def running_playwright():
+        yield playwright
+
+    with (
+        patch.object(control_server, "browser_runtime_status", return_value={
+            "ready": True, "detail": "Browser runtime ready",
+        }),
+        patch("playwright.sync_api.sync_playwright", side_effect=running_playwright),
+    ):
+        result = control_server.test_playwright_browser()
+
+    assert result["ok"] is True
+    playwright.chromium.launch.assert_called_once_with(headless=True)
+    page.set_content.assert_called_once()
+    browser.close.assert_called_once()
+
+
+def test_google_is_required_but_portal_accounts_do_not_block_readiness():
+    snapshot = {
+        "profile": {}, "searches": {}, "discovery": {}, "ai": {"provider": "none"},
+        "resume": {"text": False}, "browser_agent": {},
+        "login_connections": {"google_verified": False, "enabled_remaining": 2},
+    }
+    missing = {
+        item["label"] for item in control_server.setup_readiness(snapshot)["missing"]
+    }
+    assert "Google sign-in" in missing
+    google = next(
+        item for item in control_server.setup_readiness(snapshot)["missing"]
+        if item["label"] == "Google sign-in"
+    )
+    assert google["tab"] == "connected-accounts"
+    assert not any("job-site sign-in" in label for label in missing)
+    assert "Job-site sign-ins" in control_server.HTML
+    assert "Missing portal accounts do not block SelfApply" in control_server.HTML
+    assert "Managed Chrome</h2>" not in control_server.HTML
+    assert "Monster" not in control_server.BASE_PORTALS
+
+
+def test_browser_runtime_status_reports_missing_dependencies():
+    with (
+        patch.object(control_server.importlib.util, "find_spec", return_value=None),
+        patch.object(control_server.shutil, "which", return_value=None),
+        patch.object(control_server.config, "get_chrome_path", side_effect=FileNotFoundError),
+    ):
+        status = control_server.browser_runtime_status()
+    assert status["ready"] is False
+    assert status["python_package"] is False
+    assert status["node_runner"] is False
+    assert status["chrome"] is False
+    assert status["chromium"] is False
 
 
 def test_ui_has_cascading_location_dropdowns_examples_and_readiness_gate():
@@ -856,11 +1477,16 @@ def test_ui_has_cascading_location_dropdowns_examples_and_readiness_gate():
         assert field in control_server.HTML
     for text in (
         "Example University, City College", "Python, Java, Rust, SQL",
-        "Direct and remote boards", "Delete saved API key", "Test",
+        "Direct and remote boards", "Remove AI connection", "Test",
         "Setup incomplete", "Start Self Apply",
     ):
         assert text in control_server.HTML
     assert "startSelfApply.disabled=!complete" in control_server.HTML
+    assert "item.tab==='document-vault'?'review-apply'" in control_server.HTML
+    assert "item.tab==='document-vault'?'ats'" not in control_server.HTML
+    assert "function renderTestedAIState()" in control_server.HTML
+    assert "Click Save connection to keep this provider." in control_server.HTML
+    assert "if(pending){testedAI=pending;renderTestedAIState()}" in control_server.HTML
     assert "${ok?`<button class=secondary" in control_server.HTML
     assert (
         "names={account:'Profile','find-jobs':'Job preferences',"
@@ -976,7 +1602,7 @@ def test_application_history_ui_is_simple_and_has_direct_actions():
         "Technical detail", "Highest fit score", "Running now",
         "Needs attention", "Waiting to apply", "Show again",
         "Not eligible",
-        "View résumé", "Why this status?", "Filters", "Retry all failed applications",
+            "documentView(x.resume_url,'resume PDF',x.resume_compare_name)", "Why this status?", "Filters", "Retry all failed applications",
         "Add next",
     ):
         assert text in control_server.HTML
@@ -995,21 +1621,23 @@ def test_application_history_ui_is_simple_and_has_direct_actions():
     assert "retryAllPanel.hidden=active!=='failed'" in control_server.HTML
     assert "workers:+workers.value" in control_server.HTML
     assert "brand-mark" not in control_server.HTML
-    assert "profile-avatar" not in control_server.HTML
-    assert "window.confirm" in control_server.HTML
+    assert "profile-avatar" in control_server.HTML
+    assert 'id="appActionDialog"' in control_server.HTML
+    assert "function appConfirm(" in control_server.HTML
+    assert "window.confirm" not in control_server.HTML
+    assert "window.prompt" not in control_server.HTML
     assert "filterFailureReason" in control_server.HTML
     assert "setHistoryStatus('applied')" in control_server.HTML
 
 
 def test_ats_matcher_ui_and_plain_text_analysis(tmp_path):
     for text in (
-        "Resume tools", "Check match",
-        "Create tailored résumé", "Safe to add from master resume",
-        "Missing and unsupported", "Employer job link", "Download PDF",
-        "Starting whole-resume tailoring", "Resume was not created",
+        "Resume tools", "Check match", "Create tailored resume",
+        "Employer job link", "Download PDF", "Download DOCX",
+        "Mapping editable resume blocks", "Resume was not created",
         "Automatically add relevant JD skills", "atsAggressiveness",
         "Skill-tailoring strength", "p_skill_expansion_enabled",
-            "New JD technologies added", "See match details",
+            "See match details", "targeted changes",
     ):
         assert text in control_server.HTML
     assert "Confirmed additional skills" not in control_server.HTML
@@ -1088,7 +1716,9 @@ def test_ats_matcher_tailors_pasted_jd_and_returns_downloads(tmp_path):
     jd = "Python and AWS are required. Build reliable distributed services and production APIs. " * 3
     tailored_text = "SUMMARY\nPython engineer\nEXPERIENCE\nBuilt APIs\nEDUCATION\nBS\nSKILLS\nPython"
     ats = {"overall_score": 75, "sub_scores": {}, "matched_keywords": []}
-    report = {"status": "approved", "master_ats_match": ats, "ats_match": ats}
+    report = {"status": "approved", "master_ats_match": ats, "ats_match": ats,
+              "format_fidelity": "best-effort", "changed_block_count": 1}
+    manifest = {"source_format": "txt", "master_fingerprint": "test", "blocks": []}
 
     def fake_pdf(text_path):
         path = Path(text_path).with_suffix(".pdf")
@@ -1100,7 +1730,8 @@ def test_ats_matcher_tailors_pasted_jd_and_returns_downloads(tmp_path):
         patch.object(control_server.config, "RESUME_PATH", master),
         patch.object(control_server.config, "TAILORED_DIR", tailored_dir),
         patch.object(control_server.config, "load_profile", return_value={}),
-        patch("selfapply.scoring.tailor.tailor_resume", return_value=(tailored_text, report)) as tailor,
+        patch("selfapply.scoring.document_tailor.tailor_document",
+              return_value=(tailored_text, report, {"edits": [], "warnings": []}, manifest)) as tailor,
         patch("selfapply.scoring.pdf.convert_to_pdf", side_effect=fake_pdf),
     ):
         result = control_server.tailor_and_score_job({
@@ -1110,9 +1741,11 @@ def test_ats_matcher_tailors_pasted_jd_and_returns_downloads(tmp_path):
     assert result["master_result"]["overall_score"] == 75
     assert result["downloads"]["pdf"].endswith(".pdf")
     assert Path(result["text_path"]).is_file()
-    assert tailor.call_args.kwargs["validation_mode"] == "creative"
-    assert tailor.call_args.kwargs["allow_unverified_claims"] is True
-    assert tailor.call_args.kwargs["require_judge"] is False
+    assert isinstance(result["pdf_path"], str)
+    # Completed asynchronous tasks are returned through a JSON API.  Keep
+    # filesystem paths from leaking into that response as Path instances.
+    json.dumps(result)
+    assert tailor.call_args.kwargs["source_path"] == master
 
 
 def test_ats_tailoring_task_reports_progress_and_result():
@@ -1139,6 +1772,7 @@ def test_ats_accepts_unverified_employer_skill_without_confirmation(tmp_path):
     text = "SUMMARY\nCloud engineer\nSKILLS\nRust\nEXPERIENCE\nBuilt Rust services"
     ats = {"overall_score": 90, "sub_scores": {}, "matched_keywords": []}
     report = {"status": "approved", "master_ats_match": ats, "ats_match": ats}
+    manifest = {"source_format": "txt", "master_fingerprint": "test", "blocks": []}
 
     def fake_pdf(text_path):
         path = Path(text_path).with_suffix(".pdf")
@@ -1150,7 +1784,8 @@ def test_ats_accepts_unverified_employer_skill_without_confirmation(tmp_path):
         patch.object(control_server.config, "RESUME_PATH", master),
         patch.object(control_server.config, "TAILORED_DIR", tailored_dir),
         patch.object(control_server.config, "load_profile", return_value={}),
-        patch("selfapply.scoring.tailor.tailor_resume", return_value=(text, report)),
+        patch("selfapply.scoring.document_tailor.tailor_document",
+              return_value=(text, report, {"edits": [], "warnings": []}, manifest)),
         patch("selfapply.scoring.pdf.convert_to_pdf", side_effect=fake_pdf),
     ):
         result = control_server.tailor_and_score_job({
@@ -1168,13 +1803,15 @@ def test_ats_returns_text_download_when_pdf_verification_fails(tmp_path):
     text = "SUMMARY\nCloud engineer\nSKILLS\nRust\nEXPERIENCE\nBuilt Rust services"
     ats = {"overall_score": 90, "sub_scores": {}, "matched_keywords": []}
     report = {"status": "approved", "master_ats_match": ats, "ats_match": ats}
+    manifest = {"source_format": "txt", "master_fingerprint": "test", "blocks": []}
 
     with (
         patch.object(control_server, "service_running", return_value=False),
         patch.object(control_server.config, "RESUME_PATH", master),
         patch.object(control_server.config, "TAILORED_DIR", tailored_dir),
         patch.object(control_server.config, "load_profile", return_value={}),
-        patch("selfapply.scoring.tailor.tailor_resume", return_value=(text, report)),
+        patch("selfapply.scoring.document_tailor.tailor_document",
+              return_value=(text, report, {"edits": [], "warnings": []}, manifest)),
         patch(
             "selfapply.scoring.pdf.convert_to_pdf",
             side_effect=RuntimeError("Generated PDF contains a blank page"),
@@ -1187,7 +1824,7 @@ def test_ats_returns_text_download_when_pdf_verification_fails(tmp_path):
     assert result["ok"] is True
     assert result["downloads"]["txt"]
     assert result["downloads"]["pdf"] is None
-    assert "PDF creation failed" in result["message"]
+    assert "PDF fallback could not be rendered" in result["message"]
     assert "blank page" in result["report"]["pdf_warning"]
 
 
@@ -1221,19 +1858,16 @@ def test_batch_tailoring_uses_nonblocking_creative_mode_for_automatic_apply(tmp_
         ),
         patch.object(tailor_module, "get_connection", return_value=conn),
         patch.object(tailor_module, "get_jobs_by_stage", return_value=[job]),
-        patch.object(
-            tailor_module,
-            "tailor_resume",
-            return_value=("CREATIVE RESUME", report),
-        ) as generate,
+        patch("selfapply.scoring.document_tailor.tailor_document",
+              return_value=("CREATIVE RESUME", report,
+                            {"edits": [], "warnings": []},
+                            {"source_format": "txt", "master_fingerprint": "test", "blocks": []})) as generate,
         patch("selfapply.scoring.pdf.convert_to_pdf", return_value=tmp_path / "resume.pdf"),
     ):
         result = tailor_module.run_tailoring(limit=1)
 
     assert result["approved"] == 1
-    assert generate.call_args.kwargs["validation_mode"] == "creative"
-    assert generate.call_args.kwargs["allow_unverified_claims"] is True
-    assert generate.call_args.kwargs["require_judge"] is False
+    assert generate.call_args.kwargs["source_path"] == master
 
 
 def test_ats_activates_provider_saved_by_ui():
@@ -1474,3 +2108,216 @@ def test_local_model_url_is_normalized_and_placeholder_model_is_replaced(tmp_pat
     assert result["models"] == ["qwen-coder-7b"]
     assert result["selected_model"] == "qwen-coder-7b"
     assert "LLM_URL=http://localhost:1234/v1" in env.read_text()
+
+
+def test_resume_upload_extracts_profile_without_an_ai_provider():
+    resume = """Jordan Lee
+Platform Engineer
+Portland, Oregon, United States
+jordan@example.com | +1 503 555 0199 | https://linkedin.com/in/jordan | https://github.com/jordan
+
+SUMMARY
+Platform engineer with 8+ years of experience.
+
+TECHNICAL SKILLS
+Languages: Python, Go, SQL
+Frameworks: Django, React
+Cloud & Tools: AWS, Docker, Kubernetes
+
+EXPERIENCE
+Senior Platform Engineer | Example Corp | 2021-Present
+- Built internal services.
+
+EDUCATION
+Master of Science, Example University
+"""
+    result = control_server.extract_profile_from_resume(resume)
+    assert result["personal"]["full_name"] == "Jordan Lee"
+    assert result["personal"]["email"] == "jordan@example.com"
+    assert result["personal"]["city"] == "Portland"
+    assert result["experience"]["current_title"] == "Platform Engineer"
+    assert result["experience"]["years_of_experience_total"] == "8"
+    assert result["experience"]["education_level"] == "Master's"
+    assert result["suggested_job_titles"] == [
+        "Platform Engineer", "Senior Platform Engineer",
+    ]
+    assert result["skills_boundary"]["programming_languages"] == ["Python", "Go", "SQL"]
+    assert result["skills_boundary"]["frameworks"] == ["Django", "React"]
+    assert "AWS" in result["skills_boundary"]["tools"]
+
+
+def test_resume_import_handles_alternating_skill_categories_and_plain_responsibilities():
+    resume = """Sample Candidate
+Solution Architect
+candidate@example.com | +1 212 555 0100
+
+SUMMARY
+Solution architect with 12+ years of experience.
+
+TECHNICAL SKILLS
+AI / Data
+Predictive Analytics, Data Engineering, Spark, PySpark, Kafka
+Cloud Platforms
+Google Cloud Platform, AWS
+Databases
+Oracle, SQL Server, MySQL
+
+EDUCATION DETAILS:
+Masters in Technology at Sample University - May 2020
+
+EXPERIENCE
+Health Company - Texas Sep 2022 to April 2026
+Solution Architect Responsibilities:
+Designed cloud services for healthcare products.
+Built reporting pipelines and improved processing by 30%.
+Finance Company - New York Jan 2018 to Aug 2022
+Data Engineer Responsibilities:
+Maintained SQL data platforms.
+"""
+    result = control_server.extract_profile_from_resume(resume)
+    assert "SQL" in result["skills_boundary"]["programming_languages"]
+    assert "Spark" in result["skills_boundary"]["frameworks"]
+    assert "Google Cloud Platform" in result["skills_boundary"]["tools"]
+    assert len(result["resume_facts"]["experience_entries"]) == 2
+    assert result["resume_facts"]["preserved_companies"] == [
+        "Health Company", "Finance Company",
+    ]
+    assert result["resume_facts"]["preserved_school"] == "Sample University"
+    assert result["resume_facts"]["real_metrics"] == ["30%"]
+    assert result["suggested_job_titles"] == ["Solution Architect", "Data Engineer"]
+
+
+def test_resume_job_titles_replace_old_suggestions_and_keep_manual_titles(tmp_path):
+    searches = tmp_path / "searches.yaml"
+    searches.write_text(control_server.yaml.safe_dump({
+        "queries": [
+            {"query": "Product Engineer", "tier": 1},
+            {"query": "Old Resume Role", "tier": 2},
+        ],
+        "resume_suggested_titles": ["Old Resume Role"],
+        "sites": ["linkedin"],
+    }))
+    with patch.object(control_server.config, "SEARCH_CONFIG_PATH", searches):
+        imported = control_server._merge_resume_job_titles([
+            "Solution Architect", "Data Engineer",
+        ])
+    saved = control_server.yaml.safe_load(searches.read_text())
+    assert [item["query"] for item in saved["queries"]] == [
+        "Product Engineer", "Solution Architect", "Data Engineer",
+    ]
+    assert saved["resume_suggested_titles"] == ["Solution Architect", "Data Engineer"]
+    assert imported == ["Solution Architect", "Data Engineer"]
+
+
+def test_saving_job_preferences_preserves_only_retained_resume_suggestions(tmp_path):
+    searches = tmp_path / "searches.yaml"
+    searches.write_text(control_server.yaml.safe_dump({
+        "queries": [{"query": "Solution Architect", "tier": 1}],
+        "resume_suggested_titles": ["Solution Architect", "Data Engineer"],
+    }))
+    with patch.object(control_server.config, "SEARCH_CONFIG_PATH", searches):
+        control_server.save_search_settings({
+            "location": "Remote", "distance": 0, "hours_old": 72,
+            "results_per_site": 50, "sites": ["linkedin"],
+            "target_titles": "Solution Architect\nCloud Architect",
+        })
+    saved = control_server.yaml.safe_load(searches.read_text())
+    assert saved["resume_suggested_titles"] == ["Solution Architect"]
+
+
+def test_resume_profile_merge_fills_blanks_without_overwriting_user_values(tmp_path):
+    profile = tmp_path / "profile.json"
+    profile.write_text(json.dumps({
+        "personal": {"full_name": "Chosen Name", "email": ""},
+        "experience": {"target_role": "Product Engineer"},
+    }))
+    with patch.object(control_server.config, "PROFILE_PATH", profile):
+        imported = control_server._merge_resume_profile({
+            "personal": {"full_name": "Resume Name", "email": "resume@example.com"},
+            "experience": {"target_role": "Resume Role", "current_title": "Engineer"},
+        })
+    saved = json.loads(profile.read_text())
+    assert saved["personal"]["full_name"] == "Chosen Name"
+    assert saved["personal"]["email"] == "resume@example.com"
+    assert saved["experience"]["target_role"] == "Product Engineer"
+    assert saved["experience"]["current_title"] == "Engineer"
+    assert "personal.full_name" not in imported
+
+
+def test_replacement_resume_refreshes_resume_fields_but_preserves_user_answers(tmp_path):
+    profile = tmp_path / "profile.json"
+    profile.write_text(json.dumps({
+        "personal": {"full_name": "Old Name", "address": "123 User Entered St"},
+        "experience": {"current_title": "Old Role", "target_role": "Chosen Target"},
+        "work_authorization": {"legally_authorized_to_work": True},
+        "skills_boundary": {"programming_languages": ["OldLang"], "tools": ["OldTool"]},
+        "resume_facts": {"experience_entries": [{"header": "Old Job"}]},
+    }))
+    with patch.object(control_server.config, "PROFILE_PATH", profile):
+        imported = control_server._merge_resume_profile({
+            "personal": {"full_name": "New Name"},
+            "experience": {"current_title": "New Role", "target_role": "Resume Target"},
+            "skills_boundary": {"programming_languages": ["Python"]},
+            "resume_facts": {"experience_entries": [{"header": "New Job"}]},
+        }, replace_existing=True)
+    saved = json.loads(profile.read_text())
+    assert saved["personal"]["full_name"] == "New Name"
+    assert saved["personal"]["address"] == "123 User Entered St"
+    assert saved["experience"]["current_title"] == "New Role"
+    assert saved["experience"]["target_role"] == "Chosen Target"
+    assert saved["work_authorization"]["legally_authorized_to_work"] is True
+    assert saved["skills_boundary"]["programming_languages"] == ["Python"]
+    assert "tools" not in saved["skills_boundary"]
+    assert saved["resume_facts"]["experience_entries"] == [{"header": "New Job"}]
+    assert "personal.full_name" in imported
+
+
+def test_preparation_status_explains_zero_ready_while_scoring(tmp_path):
+    conn = database.init_db(tmp_path / "progress.db")
+    conn.executemany(
+        """INSERT INTO jobs
+           (url, title, site, full_description, detail_scraped_at, fit_score)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        [
+            ("https://example.com/1", "Role 1", "Example", "JD", "now", 8),
+            ("https://example.com/2", "Role 2", "Example", "JD", "now", None),
+            ("https://example.com/3", "Role 3", "Example", "JD", "now", None),
+        ],
+    )
+    conn.commit()
+    with patch.object(control_server, "_recent_scoring_progress", return_value=(1, 3)):
+        progress = control_server._preparation_status(
+            conn, running=True, current_job=None, ready=0,
+        )
+    assert progress == {
+        "stage": "scoring",
+        "label": "Checking job matches",
+        "detail": "Scoring 1 of 3 discovered jobs.",
+        "current": 1,
+        "total": 3,
+        "percent": 33,
+    }
+
+
+def test_self_apply_ui_shows_live_background_pipeline_before_jobs_are_ready():
+    html = control_server.HTML
+    assert "Working now:" in html
+    assert "Self Apply is running" in html
+    assert "1. Find matching jobs" in html
+    assert "2. Score and tailor matches" in html
+    assert "3. Apply automatically" in html
+    assert 'class="worker-progress-track"' in html
+
+
+def test_self_apply_ui_hides_editable_setup_during_an_active_run():
+    html = control_server.HTML
+    css = (
+        Path(control_server.__file__).with_name("ui") / "control_center.css"
+    ).read_text(encoding="utf-8")
+    assert 'id="selfApplyIntro"' in html
+    assert 'id="activeRunSummary"' in html
+    assert 'class="form worker-setup-controls"' in html
+    assert 'class="test-run-note worker-setup-controls"' in html
+    assert "selfApplyPage.classList.toggle('worker-active',s.running)" in html
+    assert "Settings are locked until you stop." in html
+    assert "#review-apply.worker-active .worker-setup-controls" in css

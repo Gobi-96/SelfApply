@@ -18,6 +18,7 @@ import copy
 from datetime import datetime, timezone
 from pathlib import Path
 
+from selfapply import config
 from selfapply.config import RESUME_PATH, TAILORED_DIR, load_profile
 from selfapply.database import get_connection, get_jobs_by_stage
 from selfapply.llm import get_client
@@ -759,12 +760,13 @@ def assemble_resume_text(data: dict, profile: dict) -> str:
 
     # Experience: headers, employers, dates, and locations are code-injected facts.
     lines.append("EXPERIENCE")
-    for entry in data.get("experience", []):
+    for index, entry in enumerate(data.get("experience", [])):
         generated_header = str(entry.get("header", ""))
-        immutable = next((
-            fact for fact in immutable_experience
-            if str(fact.get("company", "")).casefold() in generated_header.casefold()
-        ), None)
+        # The prompt gives the LLM an ordered immutable skeleton. Always restore
+        # the header by that same position: company-name matching is ambiguous
+        # for repeated clients and once caused an empty legacy company to turn
+        # every employer into the first employer in the resume.
+        immutable = immutable_experience[index] if index < len(immutable_experience) else None
         lines.append(sanitize_text(
             immutable.get("header", "") if immutable else generated_header,
         ))
@@ -1401,6 +1403,21 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
         log.info("No untailored jobs with score >= %d.", min_score)
         return {"approved": 0, "failed": 0, "errors": 0, "elapsed": 0.0}
 
+    if config.application_resume_mode(profile) == "master":
+        if not config.RESUME_PDF_PATH.is_file():
+            raise FileNotFoundError("Master resume PDF is unavailable.")
+        now = datetime.now(timezone.utc).isoformat()
+        conn.executemany(
+            "UPDATE jobs SET tailored_resume_path=?, tailored_at=? WHERE url=?",
+            ((str(RESUME_PATH), now, job["url"]) for job in jobs),
+        )
+        conn.commit()
+        log.info("Master resume mode prepared %d jobs without rewriting.", len(jobs))
+        return {
+            "approved": len(jobs), "failed": 0, "errors": 0,
+            "elapsed": 0.0, "master_resume": len(jobs),
+        }
+
     TAILORED_DIR.mkdir(parents=True, exist_ok=True)
     log.info("Tailoring resumes for %d jobs (score >= %d)...", len(jobs), min_score)
     t0 = time.time()
@@ -1414,21 +1431,40 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
     for job in jobs:
         completed += 1
         try:
-            tailored, report = tailor_resume(
-                resume_text,
-                job,
-                profile,
-                validation_mode=effective_validation_mode,
-                require_judge=not allow_unverified_claims,
-                allow_unverified_claims=allow_unverified_claims,
+            from selfapply.scoring.document_tailor import (
+                _source_path, create_tailored_artifacts, tailor_document,
+            )
+
+            source_path = _source_path(RESUME_PATH)
+            tailored, report, patch_set, manifest = tailor_document(
+                resume_text, job, profile,
+                target_aggressiveness=profile.get("skills_boundary", {}).get(
+                    "target_aggressiveness", 0.5,
+                ),
+                source_path=source_path,
             )
 
             # Build safe filename prefix
             prefix = artifact_prefix(job)
 
-            # Save tailored resume text
-            txt_path = TAILORED_DIR / f"{prefix}.txt"
-            txt_path.write_text(tailored, encoding="utf-8")
+            artifacts = create_tailored_artifacts(
+                source_path, tailored, patch_set, manifest, TAILORED_DIR / prefix,
+            )
+            txt_path = Path(artifacts["text_path"])
+            tailored = txt_path.read_text(encoding="utf-8")
+            report["ats_match"] = analyze_ats_match(
+                tailored, job.get("full_description") or "",
+                master_resume_text=resume_text,
+                company_name=str(job.get("site") or ""),
+            )
+            report["changed_block_count"] = artifacts.get(
+                "actual_edit_count", len(patch_set["edits"]),
+            )
+            actual_ids = {edit["block_id"] for edit in patch_set["edits"]}
+            report["changes"] = [
+                change for change in report.get("changes", [])
+                if change.get("block_id") in actual_ids
+            ]
 
             # Save job description for traceability
             job_path = TAILORED_DIR / f"{prefix}_JOB.txt"
@@ -1446,14 +1482,28 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
             report_path = TAILORED_DIR / f"{prefix}_REPORT.json"
             report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
 
-            # Generate PDF for approved resumes (best-effort)
-            pdf_path = None
-            if report["status"] in {"approved", "fallback_master"}:
+            # Prefer source-format rendering. The HTML renderer remains the
+            # compatibility fallback for PDF/TXT sources or systems without
+            # LibreOffice.
+            pdf_path = str(artifacts["pdf_path"]) if artifacts.get("pdf_path") else None
+            if pdf_path is None:
                 try:
                     from selfapply.scoring.pdf import convert_to_pdf
                     pdf_path = str(convert_to_pdf(txt_path))
+                    if artifacts.get("fidelity_warning"):
+                        report["format_fidelity"] = "best-effort-fallback"
+                        report["format_fidelity_warning"] = artifacts["fidelity_warning"]
                 except Exception:
                     log.debug("PDF generation failed for %s", txt_path, exc_info=True)
+            report["artifacts"] = {
+                "txt": str(txt_path),
+                "docx": str(artifacts["docx_path"]) if artifacts.get("docx_path") else None,
+                "pdf": pdf_path,
+                "manifest": str(artifacts["manifest_path"]),
+                "patches": str(artifacts["patch_path"]),
+            }
+            report["preservation_checks"] = artifacts.get("preservation_checks", {})
+            report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
 
             result = {
                 "url": job["url"],
@@ -1475,6 +1525,23 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
         results.append(result)
         stats[result.get("status", "error")] = stats.get(result.get("status", "error"), 0) + 1
 
+        # Persist every completed resume instead of holding the whole batch in
+        # memory. The UI can now report live tailoring progress, and a stopped
+        # worker does not discard resumes it already finished.
+        now = datetime.now(timezone.utc).isoformat()
+        if result["status"] == "approved":
+            conn.execute(
+                "UPDATE jobs SET tailored_resume_path=?, tailored_at=?, "
+                "tailor_attempts=COALESCE(tailor_attempts,0)+1 WHERE url=?",
+                (result["path"], now, result["url"]),
+            )
+        else:
+            conn.execute(
+                "UPDATE jobs SET tailor_attempts=COALESCE(tailor_attempts,0)+1 WHERE url=?",
+                (result["url"],),
+            )
+        conn.commit()
+
         elapsed = time.time() - t0
         rate = completed / elapsed if elapsed > 0 else 0
         log.info(
@@ -1485,25 +1552,6 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
             rate * 60,
             result["title"][:40],
         )
-
-    # Persist to DB: automatic application workers must never receive a
-    # master-fallback document. Keep that artifact/report for review, but only
-    # a genuinely tailored result becomes eligible for the apply queue.
-    now = datetime.now(timezone.utc).isoformat()
-    _success_statuses = {"approved"}
-    for r in results:
-        if r["status"] in _success_statuses:
-            conn.execute(
-                "UPDATE jobs SET tailored_resume_path=?, tailored_at=?, "
-                "tailor_attempts=COALESCE(tailor_attempts,0)+1 WHERE url=?",
-                (r["path"], now, r["url"]),
-            )
-        else:
-            conn.execute(
-                "UPDATE jobs SET tailor_attempts=COALESCE(tailor_attempts,0)+1 WHERE url=?",
-                (r["url"],),
-            )
-    conn.commit()
 
     elapsed = time.time() - t0
     log.info(

@@ -106,6 +106,21 @@ class ResumeFactValidationTests(unittest.TestCase):
         self.assertFalse(result["passed"])
         self.assertTrue(any("placeholder" in error.lower() for error in result["errors"]))
 
+    def test_resume_without_projects_can_tailor_without_fallback(self):
+        profile = json.loads(json.dumps(self.profile))
+        profile["resume_facts"]["preserved_projects"] = []
+        data = self._data()
+        data["projects"] = []
+        original = self.original.replace("Example Project ", "")
+        result = validate_json_fields(data, profile, original_text=original)
+        self.assertTrue(result["passed"], result["errors"])
+
+        text = assemble_resume_text(data, profile)
+        full_result = validate_tailored_resume(
+            text, profile, original_text=original,
+        )
+        self.assertTrue(full_result["passed"], full_result["errors"])
+
     def test_assembly_injects_immutable_experience_and_education(self):
         data = self._data()
         data["experience"][0]["header"] = "Invented Role at Example Company"
@@ -118,6 +133,21 @@ class ResumeFactValidationTests(unittest.TestCase):
         self.assertNotIn("Invented Role", text)
         self.assertNotIn("Tech | Dates", text)
         self.assertNotIn("Incomplete school", text)
+
+    def test_legacy_headers_without_company_do_not_repeat_first_employer(self):
+        profile = json.loads(json.dumps(self.profile))
+        profile["resume_facts"]["experience_entries"] = [
+            {"header": "First Company - Jan 2022 to Present | Engineer"},
+            {"header": "Second Company - Jan 2020 to Dec 2021 | Analyst"},
+        ]
+        data = self._data()
+        data["experience"] = [
+            {"header": "First Company | Engineer", "subtitle": "", "bullets": ["First."]},
+            {"header": "Second Company | Analyst", "subtitle": "", "bullets": ["Second."]},
+        ]
+        text = assemble_resume_text(data, profile)
+        self.assertEqual(text.count("First Company - Jan 2022 to Present"), 1)
+        self.assertEqual(text.count("Second Company - Jan 2020 to Dec 2021"), 1)
 
     def test_full_validator_rejects_malformed_contact_url(self):
         text = assemble_resume_text(self._data(), self.profile).replace(

@@ -152,6 +152,9 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
                    WHERE url = ?""",
                 (f"[EARLY ELIGIBILITY FILTER] {reason}", now, reason, job["url"]),
             )
+            # Make batch progress visible to the control center immediately
+            # and preserve completed work if the process is interrupted.
+            conn.commit()
             ineligible += 1
             completed += 1
             log.info(
@@ -170,6 +173,17 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
             )
         result = score_job(resume_text, job)
         result["url"] = job["url"]
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            "UPDATE jobs SET fit_score = ?, score_reasoning = ?, scored_at = ? WHERE url = ?",
+            (
+                result["score"],
+                f"{result['keywords']}\n{result['reasoning']}",
+                now,
+                result["url"],
+            ),
+        )
+        conn.commit()
         completed += 1
 
         if result["score"] == 0:
@@ -181,15 +195,6 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
             "[%d/%d] score=%d  %s",
             completed, len(jobs), result["score"], job.get("title", "?")[:60],
         )
-
-    # Write scores to DB
-    now = datetime.now(timezone.utc).isoformat()
-    for r in results:
-        conn.execute(
-            "UPDATE jobs SET fit_score = ?, score_reasoning = ?, scored_at = ? WHERE url = ?",
-            (r["score"], f"{r['keywords']}\n{r['reasoning']}", now, r["url"]),
-        )
-    conn.commit()
 
     elapsed = time.time() - t0
     log.info("Done: %d scored in %.1fs (%.1f jobs/sec)", len(results), elapsed, len(results) / elapsed if elapsed > 0 else 0)

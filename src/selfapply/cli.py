@@ -465,6 +465,10 @@ def run_worker(
     max_actions: int = typer.Option(150, "--max-actions"),
     max_minutes: int = typer.Option(15, "--max-minutes"),
     dry_run: bool = typer.Option(False, "--dry-run"),
+    test_limit: int = typer.Option(
+        0, "--test-limit", hidden=True,
+        help="Stop after this many successful dry-run form checks.",
+    ),
     headless: bool = typer.Option(False, "--headless"),
     validation: str = typer.Option("normal", "--validation"),
     skip_smart_extract: bool = typer.Option(False, "--skip-smart-extract"),
@@ -482,6 +486,9 @@ def run_worker(
         raise typer.Exit(code=1)
     if max_spend <= 0:
         console.print("[red]--max-spend must be greater than 0.[/red]")
+        raise typer.Exit(code=1)
+    if test_limit < 0 or (test_limit and not dry_run):
+        console.print("[red]--test-limit requires --dry-run and cannot be negative.[/red]")
         raise typer.Exit(code=1)
     settings = _resolve_apply_settings(
         agent=agent, browser=browser, model=model, max_actions=max_actions,
@@ -504,6 +511,7 @@ def run_worker(
         min_score=min_score,
         headless=headless,
         dry_run=dry_run,
+        test_limit=test_limit,
         workers=workers,
         **settings,
         min_delay=config.DEFAULTS["apply_min_delay_seconds"],

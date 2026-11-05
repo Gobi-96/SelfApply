@@ -187,6 +187,7 @@ def run_worker_supervisor(
     validation_mode: str = "normal",
     pipeline_workers: int = 1,
     smart_extract: bool = True,
+    test_limit: int = 0,
     **apply_kwargs,
 ) -> None:
     """Run queue replenishment in the background and apply in the main thread.
@@ -213,6 +214,15 @@ def run_worker_supervisor(
 
     def apply_stop_condition() -> bool:
         """Enforce caps at every job boundary, not only on the poll timer."""
+        if test_limit and apply_kwargs.get("dry_run"):
+            completed_tests = int(get_totals().get("applied") or 0)
+            if completed_tests >= test_limit:
+                _set_stop_reason("test_run_complete")
+                add_event(
+                    f"[worker] Test run complete — {completed_tests} form"
+                    f"{'s' if completed_tests != 1 else ''} checked without submission"
+                )
+                return True
         applied_count, _ = queue_snapshot(
             apply_kwargs.get("min_score", config.DEFAULTS["min_score"]),
             config.DEFAULTS["max_apply_attempts"],

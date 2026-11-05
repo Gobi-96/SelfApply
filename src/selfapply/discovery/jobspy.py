@@ -221,6 +221,9 @@ def _run_one_search(
             "country_indeed": defaults.get("country_indeed", "usa"),
             "verbose": 0,
         }
+        distance = defaults.get("distance")
+        if isinstance(distance, (int, float)) and distance > 0:
+            kwargs["distance"] = int(distance)
         if s.get("remote"):
             kwargs["is_remote"] = True
         if proxy_config:
@@ -244,6 +247,9 @@ def _run_one_search(
             "description_format": "markdown",
             "verbose": 0,
         }
+        distance = defaults.get("distance")
+        if isinstance(distance, (int, float)) and distance > 0:
+            gd_kwargs["distance"] = int(distance)
         if s.get("remote"):
             gd_kwargs["is_remote"] = True
         if proxy_config:
