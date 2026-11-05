@@ -13,6 +13,7 @@ import subprocess
 import threading
 import time
 import urllib.request
+from contextlib import closing
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -92,7 +93,12 @@ def has_google_auth_session(profile_dir: Path | None = None) -> bool:
         if not cookie_db.exists():
             continue
         try:
-            with sqlite3.connect(f"file:{cookie_db}?mode=ro", uri=True, timeout=0.2) as connection:
+            # sqlite3.Connection's context manager does not close the handle.
+            # Explicit closing matters on Windows, where an open cookie DB
+            # prevents temporary/profile directories from being removed.
+            with closing(sqlite3.connect(
+                f"file:{cookie_db}?mode=ro", uri=True, timeout=0.2,
+            )) as connection:
                 placeholders = ",".join("?" for _ in _GOOGLE_AUTH_COOKIES)
                 row = connection.execute(
                     f"SELECT 1 FROM cookies WHERE host_key LIKE '%google.com' "

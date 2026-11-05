@@ -1,4 +1,5 @@
 import unittest
+import json
 import sqlite3
 import sys
 from types import ModuleType
@@ -295,7 +296,8 @@ class CodexAdapterTests(unittest.TestCase):
         self.assertIn("--extension", rendered)
         self.assertNotIn("--cdp-endpoint", rendered)
         self.assertIn("PLAYWRIGHT_MCP_EXTENSION_TOKEN", rendered)
-        self.assertIn('mcp_servers.playwright.cwd="/tmp/apply-worker-0"', rendered)
+        expected_cwd = json.dumps(str(Path("/tmp/apply-worker-0")))
+        self.assertIn(f"mcp_servers.playwright.cwd={expected_cwd}", rendered)
 
     def test_codex_command_can_reuse_shared_playwright_runtime(self):
         with patch("pathlib.Path.exists", return_value=False):
@@ -753,9 +755,9 @@ class CodexAdapterTests(unittest.TestCase):
     def test_process_tree_cleanup_never_kills_own_process_group(self):
         with (
             patch("selfapply.apply.chrome.platform.system", return_value="Darwin"),
-            patch("os.getpgid", return_value=777),
-            patch("os.getpgrp", return_value=777),
-            patch("os.killpg") as kill_group,
+            patch("os.getpgid", return_value=777, create=True),
+            patch("os.getpgrp", return_value=777, create=True),
+            patch("os.killpg", create=True) as kill_group,
             patch("os.kill") as kill_process,
         ):
             _kill_process_tree(12345)

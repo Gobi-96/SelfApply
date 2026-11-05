@@ -2135,7 +2135,7 @@ def _active_service_label() -> str | None:
     """
     if platform.system() != "Darwin":
         return None
-    result = _launchctl("print", f"gui/{os.getuid()}/{LABEL}")
+    result = _launchctl("print", f"{_launchd_gui_domain()}/{LABEL}")
     if result.returncode:
         return None
     output = result.stdout.casefold()
@@ -2169,6 +2169,12 @@ def _active_service_label() -> str | None:
 
 def _plist_for_label(label: str) -> Path:
     return PLIST_PATH
+
+
+def _launchd_gui_domain() -> str:
+    """Return the per-user launchd domain, including in cross-platform tests."""
+    getuid = getattr(os, "getuid", None)
+    return f"gui/{getuid() if getuid else 0}"
 
 
 def _worker_configuration(path: Path) -> dict:
@@ -2254,7 +2260,7 @@ def _install_worker_service(arguments: list[str], *, continuous: bool) -> None:
             "started_at": datetime.now(timezone.utc).isoformat(),
         })
         return
-    _launchctl("bootout", f"gui/{os.getuid()}/{LABEL}")
+    _launchctl("bootout", f"{_launchd_gui_domain()}/{LABEL}")
     config.ensure_dirs()
     PLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
     repo = Path(__file__).resolve().parents[2]
@@ -2283,7 +2289,7 @@ def _install_worker_service(arguments: list[str], *, continuous: bool) -> None:
     )
     if checked.returncode:
         raise RuntimeError(f"Worker definition is invalid: {checked.stderr.strip()}")
-    result = _launchctl("bootstrap", f"gui/{os.getuid()}", str(PLIST_PATH))
+    result = _launchctl("bootstrap", _launchd_gui_domain(), str(PLIST_PATH))
     if result.returncode:
         raise RuntimeError(result.stderr.strip() or "Unable to start the worker.")
 
@@ -2328,7 +2334,7 @@ def start_test_run(payload: dict) -> dict:
 
 def stop_worker() -> dict:
     if platform.system() == "Darwin":
-        _launchctl("bootout", f"gui/{os.getuid()}/{LABEL}")
+        _launchctl("bootout", f"{_launchd_gui_domain()}/{LABEL}")
     else:
         state = _background_worker_state()
         if state:
@@ -2595,7 +2601,10 @@ def daily_activity_stats(days: int = 7) -> dict:
         "days": [
             {
                 "date": day,
-                "label": datetime.strptime(day, "%Y-%m-%d").strftime("%-m/%-d"),
+                "label": (
+                    f"{datetime.strptime(day, '%Y-%m-%d').month}/"
+                    f"{datetime.strptime(day, '%Y-%m-%d').day}"
+                ),
                 "applied": int((by_day.get(day) or {}).get("applied") or 0),
             }
             for day in ordered_days

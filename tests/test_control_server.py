@@ -245,7 +245,7 @@ def test_start_repairs_plist_and_refuses_duplicate(tmp_path):
     content = control_server.plistlib.loads(plist.read_bytes())
     assert "--max-spend" in content["ProgramArguments"]
     assert content["WorkingDirectory"] == str(Path(control_server.__file__).resolve().parents[2])
-    assert content["ProgramArguments"][0] == "/test/selfapply"
+    assert content["ProgramArguments"][0] == str(Path("/test/selfapply"))
     assert any(call.args[0] == "bootstrap" for call in launch.call_args_list)
     assert not any(call.args[0] == "kickstart" for call in launch.call_args_list)
 
@@ -1915,7 +1915,7 @@ def test_retry_now_targets_one_exact_job_and_uses_one_shot_worker(tmp_path):
         result = control_server.start_application_retry(payload)
     assert result["ok"] is True
     arguments = install.call_args.args[0]
-    assert arguments[0] == "/test/selfapply"
+    assert arguments[0] == str(Path("/test/selfapply"))
     assert arguments[1:5] == ["apply", "--limit", "1", "--url"]
     assert arguments[5] == "https://example.com/job/7"
     assert install.call_args.kwargs == {"continuous": False}
