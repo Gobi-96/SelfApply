@@ -1247,14 +1247,21 @@ RESULT:FAILED:<brief_reason>
 def queued_portal_targets() -> dict[str, str]:
     """Return tenant-keyed portal URLs represented by the current queued jobs."""
     conn = get_connection()
-    rows = conn.execute(
-        """
-        SELECT url, application_url FROM jobs
-        WHERE applied_at IS NULL
-          AND (apply_status IS NULL OR apply_status != 'applied')
-          AND fit_score IS NOT NULL
-        """
-    ).fetchall()
+    try:
+        rows = conn.execute(
+            """
+            SELECT url, application_url FROM jobs
+            WHERE applied_at IS NULL
+              AND (apply_status IS NULL OR apply_status != 'applied')
+              AND fit_score IS NOT NULL
+            """
+        ).fetchall()
+    except sqlite3.OperationalError as exc:
+        # Settings can be opened before first-run database initialization. In
+        # that state there are simply no queued portals to add to the defaults.
+        if "no such table" not in str(exc).casefold():
+            raise
+        rows = []
     targets: dict[str, str] = {}
     for row in rows:
         target = _clean_optional_url(row["application_url"]) or row["url"]

@@ -1,5 +1,10 @@
 name: CI
 
+env:
+  # Keep Rich/CLI output UTF-8 on Windows runners whose legacy console defaults
+  # to cp1252. The application intentionally uses readable Unicode status text.
+  PYTHONUTF8: "1"
+
 on:
   workflow_dispatch:
   push:
@@ -15,15 +20,18 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
 
       - name: Install dependencies
         run: pip install -e ".[dev]"
+
+      - name: Install browser runtime
+        run: python -m playwright install chromium
 
       - name: Lint
         # Gate correctness errors now; the repository's broader style backlog
@@ -43,15 +51,18 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
       - name: Install dependencies
         run: python -m pip install -e ".[dev]"
+
+      - name: Install browser runtime
+        run: python -m playwright install chromium
 
       - name: Verify package and platform paths
         run: |

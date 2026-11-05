@@ -48,15 +48,16 @@ def test_start_requires_confirmation_and_positive_spend():
 
 
 def test_worker_arguments_include_guardrails():
-    args = control_server.build_program_arguments(
-        control_server.validate_start_payload(valid_payload())
-    )
+    executable = Path("/test/selfapply")
+    with patch.object(control_server, "_selfapply_executable", return_value=executable):
+        args = control_server.build_program_arguments(
+            control_server.validate_start_payload(valid_payload())
+        )
     assert args[1] == "run-worker"
     assert args[args.index("--max-spend") + 1] == "12.5"
     assert args[args.index("--workers") + 1] == "1"
     assert "--skip-smart-extract" in args
-    expected = Path(control_server.__file__).resolve().parents[2] / ".venv/bin/selfapply"
-    assert Path(args[0]) == expected
+    assert Path(args[0]) == executable
 
 
 def test_test_run_arguments_fill_one_job_without_submission():
@@ -228,6 +229,8 @@ def test_start_repairs_plist_and_refuses_duplicate(tmp_path):
     completed = control_server.subprocess.CompletedProcess([], 0, "", "")
     with (
         patch.object(control_server, "PLIST_PATH", plist),
+        patch.object(control_server.platform, "system", return_value="Darwin"),
+        patch.object(control_server, "_selfapply_executable", return_value=Path("/test/selfapply")),
         patch.object(control_server, "service_running", return_value=False),
         patch.object(control_server, "settings_snapshot", return_value={}),
             patch.object(control_server, "setup_readiness", return_value={
@@ -242,9 +245,7 @@ def test_start_repairs_plist_and_refuses_duplicate(tmp_path):
     content = control_server.plistlib.loads(plist.read_bytes())
     assert "--max-spend" in content["ProgramArguments"]
     assert content["WorkingDirectory"] == str(Path(control_server.__file__).resolve().parents[2])
-    assert content["ProgramArguments"][0] == str(
-        Path(control_server.__file__).resolve().parents[2] / ".venv/bin/selfapply"
-    )
+    assert content["ProgramArguments"][0] == "/test/selfapply"
     assert any(call.args[0] == "bootstrap" for call in launch.call_args_list)
     assert not any(call.args[0] == "kickstart" for call in launch.call_args_list)
 
@@ -1907,14 +1908,14 @@ def test_retry_now_targets_one_exact_job_and_uses_one_shot_worker(tmp_path):
         patch.object(control_server, "service_running", return_value=False),
         patch.object(control_server, "settings_snapshot", return_value={}),
         patch.object(control_server, "setup_readiness", return_value=readiness),
+        patch.object(control_server, "ensure_browser_runtime", return_value={"ready": True}),
+        patch.object(control_server, "_selfapply_executable", return_value=Path("/test/selfapply")),
         patch.object(control_server, "_install_worker_service") as install,
     ):
         result = control_server.start_application_retry(payload)
     assert result["ok"] is True
     arguments = install.call_args.args[0]
-    assert arguments[0] == str(
-        Path(control_server.__file__).resolve().parents[2] / ".venv/bin/selfapply"
-    )
+    assert arguments[0] == "/test/selfapply"
     assert arguments[1:5] == ["apply", "--limit", "1", "--url"]
     assert arguments[5] == "https://example.com/job/7"
     assert install.call_args.kwargs == {"continuous": False}

@@ -1,5 +1,7 @@
 import unittest
 import sqlite3
+import sys
+from types import ModuleType
 from tempfile import TemporaryDirectory
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -152,15 +154,24 @@ class CodexAdapterTests(unittest.TestCase):
         self.assertIn("application has been submitted", evidence)
 
     def test_discovery_can_skip_smart_extract_without_changing_default_sources(self):
+        jobspy_module = ModuleType("selfapply.discovery.jobspy")
+        jobspy_module.run_discovery = Mock()
+        workday_module = ModuleType("selfapply.discovery.workday")
+        workday_module.run_workday_discovery = Mock()
+        smart_module = ModuleType("selfapply.discovery.smartextract")
+        smart_module.run_smart_extract = Mock()
         with (
-            patch("selfapply.discovery.jobspy.run_discovery") as jobspy,
-            patch("selfapply.discovery.workday.run_workday_discovery") as workday,
-            patch("selfapply.discovery.smartextract.run_smart_extract") as smart,
+            patch("selfapply.pipeline._require_jobspy"),
+            patch.dict(sys.modules, {
+                "selfapply.discovery.jobspy": jobspy_module,
+                "selfapply.discovery.workday": workday_module,
+                "selfapply.discovery.smartextract": smart_module,
+            }),
         ):
             result = _run_discover(workers=2, smart_extract=False)
-        jobspy.assert_called_once_with()
-        workday.assert_called_once_with(workers=2)
-        smart.assert_not_called()
+        jobspy_module.run_discovery.assert_called_once_with()
+        workday_module.run_workday_discovery.assert_called_once_with(workers=2)
+        smart_module.run_smart_extract.assert_not_called()
         self.assertEqual(result["smartextract"], "skipped")
 
     def test_extension_token_accepts_full_assignment(self):
